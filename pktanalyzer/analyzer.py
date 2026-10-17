@@ -8,6 +8,7 @@ from . import dns, http, tls
 from .anomalies import AnomalyDetector
 from .decoder import Decoder
 from .flows import FlowTracker
+from .hosts import HostProfiler
 from .packet import Packet
 from .pcap import Frame
 
@@ -21,6 +22,7 @@ class Analyzer:
         # stream-level findings (TLS certificates, ...) reach the detector through the tracker
         self.tracker.listeners.append(
             lambda flow, kind, data: self.detector.flow_event(self.tracker.current, flow, kind, data))
+        self.hosts = HostProfiler()
         self.keep_packets = keep_packets
         # keep every packet for offline analysis, or a ring buffer for live views
         self.packets: list[Packet] | deque = deque(maxlen=history) if history else []
@@ -39,6 +41,7 @@ class Analyzer:
         pkt = self.decoder.decode(self.count, frame.ts, frame.data, frame.linktype, frame.orig_len)
         flow = self.tracker.process(pkt)
         self.detector.process(pkt, flow)
+        self.hosts.process(pkt)
         self._stats(pkt)
         if self.keep_packets:
             self.packets.append(pkt)

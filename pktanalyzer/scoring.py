@@ -11,10 +11,13 @@ import ipaddress
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from .analyzer import Analyzer
 from .anomalies import SUSPICIOUS_PORTS
 from .flows import WELL_KNOWN, Flow
+
+if TYPE_CHECKING:
+    from .analyzer import Analyzer
 
 BACKDOOR_PORTS = {4444, 5554, 6667, 12345, 31337, 1337}
 SCANNER_RULES = {"port-scan", "host-sweep", "udp-scan", "xmas-scan", "null-scan", "fin-scan", "syn-fin"}
@@ -38,10 +41,16 @@ def level_for(score: int) -> str:
     return "HIGH" if score >= 70 else "MEDIUM" if score >= 40 else "LOW" if score >= 15 else "NONE"
 
 
+# Documentation ranges count as public: they stand in for internet hosts in examples and test captures.
+DOC_NETS = [ipaddress.ip_network(n) for n in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32")]
+
+
 def is_private(ip: str) -> bool:
     try:
         a = ipaddress.ip_address(ip)
     except ValueError:
+        return False
+    if any(a in n for n in DOC_NETS if n.version == a.version):
         return False
     return a.is_private or a.is_link_local or a.is_loopback
 

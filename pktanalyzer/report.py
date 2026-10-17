@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from html import escape
 
-from . import __version__, explain, timeline
+from . import __version__, explain, hosts as host_profiles, timeline
 from .analyzer import Analyzer
 from .export import _safe, packet_dict
 from .scoring import score_flows
@@ -55,6 +55,7 @@ details summary{cursor:pointer;color:var(--accent);margin:8px 0}svg text{fill:va
 .two{display:grid;grid-template-columns:1fr 1fr;gap:20px}@media (max-width:900px){.two{grid-template-columns:1fr}}
 a.dl{display:inline-block;margin:4px 8px 4px 0;padding:6px 12px;border-radius:6px;background:var(--chip);
 color:var(--text);text-decoration:none}a.dl:hover{background:var(--line)}
+td.wrap{overflow-wrap:anywhere;min-width:120px}
 footer{color:var(--muted);text-align:center;font-size:12px;padding-bottom:24px}
 """
 
@@ -275,6 +276,41 @@ def build_report(an: Analyzer, source: str) -> str:
                 '<p class="muted">Alert counts are for alerts this host <i>caused</i>; "targeted by" counts alerts '
                 "where it was the victim.</p>")
 
+    profiles = host_profiles.profile(an)
+    shown = [h for h in profiles if h.local or h.alerts_caused or h.services or h.max_risk][:40]
+    if shown:
+        rows = []
+        for h in shown:
+            ident = f'<span class="mono">{_e(h.addr)}</span>'
+            if h.name:
+                ident += f'<br>{_e(h.name)}'
+            if h.mac and not h.routed:
+                ident += f'<br><span class="mono muted">{_e(h.mac)}</span>'
+            roles = " ".join(f'<span class="chip" style="{"color:" + SEV_COLOR["high"] if r == "scanner" else ""}">'
+                             f'{_e(r)}</span>' for r in h.roles)
+            ports = ", ".join(f'{_e(k.split("/")[0])}' + ("" if v["label"].startswith("port ") else
+                                                          f' <span class="muted">{_e(v["label"])}</span>')
+                              for k, v in sorted(h.services.items(), key=lambda kv: int(kv[0].split("/")[0]))[:8])
+            lookups = "<br>".join(_e(d) for d, _ in h.domains.most_common(5))
+            if len(h.domains) > 5:
+                lookups += f'<br><span class="muted">+{len(h.domains) - 5} more</span>'
+            extra = []
+            if h.sni:
+                extra.append("TLS: " + ", ".join(h.sni))
+            if h.user_agents:
+                extra.append("UA: " + ", ".join(h.user_agents))
+            alerts = " ".join(f'<span class="badge" style="background:{SEV_COLOR[sev]}">{h.alerts_caused[sev]}</span>'
+                              for sev in ("high", "medium", "low") if h.alerts_caused[sev])
+            rows.append(f'<tr><td>{ident}</td><td>{_e(h.os)}</td><td>{roles}</td><td>{ports}</td>'
+                        f'<td class="mono wrap">{lookups}</td><td class="muted wrap">{_e("; ".join(extra))}</td>'
+                        f'<td class="num">{_bytes(h.bytes_sent)}<br><span class="muted">{_bytes(h.bytes_recv)}</span></td>'
+                        f'<td>{alerts}</td></tr>')
+        section("profiles", f"Host profiles ({len(shown)})",
+                "<table><tr><th>Host</th><th>OS guess</th><th>Role</th><th>Open ports</th><th>DNS lookups</th>"
+                "<th>TLS / HTTP clients</th><th>Sent / recv</th><th>Alerts</th></tr>" + "".join(rows) + "</table>"
+                '<p class="muted">OS guesses come from the initial TTL and the TCP SYN window and options, and are '
+                "approximate. Hosts behind a router show no MAC because their frames carry the router's.</p>")
+
     talkers = [(ip, b, _bytes(b)) for ip, b in an.talkers.most_common(12)]
     names = {"ethernet": "Ethernet", "ipv4": "IPv4", "ipv6": "IPv6", "arp": "ARP", "tcp": "TCP", "udp": "UDP",
              "icmp": "ICMP", "icmpv6": "ICMPv6", "dns": "DNS", "http": "HTTP", "tls": "TLS", "dhcp": "DHCP",
@@ -361,7 +397,7 @@ def build_report(an: Analyzer, source: str) -> str:
         _data_link("alerts.json", [a.to_dict() for a in an.alerts]),
         _data_link("flows.json", [_safe(f.to_dict()) for f in an.flows]),
         _data_link("timeline.json", [e.to_dict(t0) for e in events]),
-        _data_link("hosts.json", hosts),
+        _data_link("hosts.json", [h.to_dict() for h in profiles]),
     ]
     if an.keep_packets and len(an.packets) <= 20000:
         exports.append(_data_link("packets.json", [packet_dict(p) for p in an.packets]))

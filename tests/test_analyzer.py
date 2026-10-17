@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, dns, explain, filters, report, scoring, timeline, tls, x509      # noqa: E402
+from pktanalyzer import craft, dns, explain, filters, hosts, report, scoring, timeline, tls, x509  # noqa: E402
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -423,6 +423,64 @@ class TestScoring(unittest.TestCase):
         self.assertIn("upload-heavy", text)
 
 
+class TestHosts(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            cls.an = Analyzer()
+            for _ in cls.an.run(open_capture(path)):
+                pass
+        cls.hosts = {h.addr: h for h in hosts.profile(cls.an)}
+
+    def test_roles_and_services(self):
+        h = self.hosts
+        self.assertIn("scanner", h["10.0.0.66"].roles)
+        self.assertEqual(h["10.0.0.66"].mac, "de:ad:be:ef:00:66")
+        self.assertIn("gateway", h["10.0.0.1"].roles)
+        self.assertIn("DNS server", h["10.0.0.1"].roles)
+        victim = h["10.0.0.23"]
+        self.assertEqual(victim.open_ports, [22, 8080])          # answered the scan / served sqlmap
+        self.assertIn(21, victim.closed_ports)
+        self.assertNotIn(8080, victim.closed_ports)
+        self.assertTrue(any("evil-c2" in d for d in victim.domains))
+        self.assertIn("login.paypa1-secure.com", victim.sni)
+        self.assertEqual(victim.os, "Linux")
+        phish = h["203.0.113.50"]
+        self.assertEqual(phish.name, "login.paypa1-secure.com")  # learned from the DNS answer
+        self.assertIn("external", phish.roles)
+        self.assertTrue(phish.routed)
+        self.assertEqual(phish.alerts_caused["high"], 3)
+        self.assertEqual(phish.max_risk, 100)
+        # most interesting hosts come first
+        self.assertEqual(hosts.profile(self.an)[0].addr, "10.0.0.66")
+        json.dumps([x.to_dict() for x in self.hosts.values()])
+
+    def test_os_guess(self):
+        self.assertEqual(hosts.initial_ttl(57), 64)
+        self.assertEqual(hosts.initial_ttl(116), 128)
+        self.assertEqual(hosts.guess_os(128, dict(window=64240, options="mss,ws,sack")), "Windows")
+        self.assertEqual(hosts.guess_os(64, dict(window=65535, options="mss,ts,ws")), "macOS/iOS/BSD")
+        self.assertEqual(hosts.guess_os(64, dict(window=1024, options="")), "? (crafted SYNs)")
+        self.assertEqual(hosts.guess_os(250, None), "network device")
+
+    def test_dhcp_hostname(self):
+        cmac = "02:00:00:00:00:aa"
+        an = Analyzer()
+        frames = [
+            craft.ethernet(cmac, "ff:ff:ff:ff:ff:ff", 0x0800, craft.ipv4("0.0.0.0", "255.255.255.255", 17, craft.udp(
+                "0.0.0.0", "255.255.255.255", 68, 67, craft.dhcp(1, 3, cmac, hostname="nk-laptop")))),
+            craft.ethernet(cmac, MB, 0x0800, craft.ipv4("192.168.1.40", "192.168.1.1", 17, craft.udp(
+                "192.168.1.40", "192.168.1.1", 5000, 53, craft.dns_query(1, "example.com")))),
+        ]
+        for i, fr in enumerate(frames):
+            an.feed(Frame(1.0 + i, fr, LINKTYPE_ETHERNET, len(fr)))
+        prof = {h.addr: h for h in hosts.profile(an)}
+        self.assertEqual(prof["192.168.1.40"].name, "nk-laptop")
+        self.assertEqual(prof["192.168.1.40"].names["nk-laptop"], "dhcp")
+
+
 class TestReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -482,6 +540,7 @@ class TestCLI(unittest.TestCase):
                          ["alerts", path], ["alerts", path, "--explain"], ["timeline", path], ["risk", path],
                          ["tls", path, "--certs"], ["flows", path, "--sort", "risk"],
                          ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
+                         ["hosts", path], ["hosts", path, "10.0.0.23"], ["hosts", path, "--all", "-n", "3"],
                          ["report", path, "-o", os.path.join(d, "r.html")],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)

@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from . import __version__, explain, report, scoring, timeline, ui
+from . import __version__, explain, hosts, report, scoring, timeline, ui
 from .analyzer import Analyzer
 from .capture import CaptureError, default_interface, list_interfaces, live_frames
 from .craft import write_sample
@@ -125,6 +125,23 @@ def cmd_risk(args) -> None:
     if args.min:
         flows = [f for f in flows if f.risk.score >= args.min]
     con.print(ui.risk_table(flows, limit=args.limit, show_all=args.all))
+
+
+def cmd_hosts(args) -> None:
+    an = _analyze(args.file, keep=False)
+    profiles = hosts.profile(an)
+    if args.addr:
+        match = [h for h in profiles if h.addr == args.addr or args.addr in h.names or args.addr in h.macs]
+        if not match:
+            con.print(f"[red]No host matches {args.addr!r}.[/] Known: " + ", ".join(h.addr for h in profiles[:12]))
+            raise SystemExit(1)
+        for h in match:
+            con.print(ui.host_panel(h, an.first_ts))
+        return
+    if not args.all:
+        profiles = [h for h in profiles if h.local or h.alerts_caused or h.services or h.max_risk]
+    con.print(ui.hosts_table(profiles, args.n))
+    con.print("[grey50]Run [bold]hosts FILE ADDRESS[/] for the full profile of one host.")
 
 
 def cmd_tls(args) -> None:
@@ -325,6 +342,13 @@ def build_parser() -> argparse.ArgumentParser:
     rk.add_argument("--min", type=int, help="only flows scoring at least this")
     rk.add_argument("--all", action="store_true", help="include flows that scored 0")
     rk.set_defaults(func=cmd_risk)
+
+    ho = sub.add_parser("hosts", help="profile every host: names, MAC, OS guess, role, services, lookups, alerts")
+    ho.add_argument("file")
+    ho.add_argument("addr", nargs="?", help="show the full profile of one IP, MAC or hostname")
+    ho.add_argument("-n", type=int, help="show only the first N hosts")
+    ho.add_argument("--all", action="store_true", help="include idle external hosts")
+    ho.set_defaults(func=cmd_hosts)
 
     ts_ = sub.add_parser("tls", help="TLS sessions: SNI, version, cipher suite and certificate details")
     ts_.add_argument("file")

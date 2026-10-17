@@ -69,6 +69,12 @@ def export_all(an: Analyzer, out_dir: str, packets: list[Packet] | None = None, 
         json.dump([a.to_dict() for a in an.alerts], f, indent=2)
     written["alerts.json"] = p
 
+    from .hosts import profile
+    p = os.path.join(out_dir, "hosts.json")
+    with open(p, "w") as f:
+        json.dump([h.to_dict() for h in profile(an)], f, indent=2, default=str)
+    written["hosts.json"] = p
+
     dns_log = [dict(flow=fl.id, client=fl.client[0], server=fl.server[0], **d) for fl in an.flows for d in fl.dns]
     if dns_log:
         p = os.path.join(out_dir, "dns.json")

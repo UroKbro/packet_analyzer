@@ -18,6 +18,7 @@ from .analyzer import Analyzer, info
 from .anomalies import SEVERITY_ORDER, Alert
 from .flows import Flow
 from .packet import Packet
+from .scoring import level_for
 
 PROTO_STYLE = {
     "TCP": "cyan", "UDP": "dodger_blue1", "DNS": "magenta", "MDNS": "magenta", "HTTP": "green3",
@@ -423,6 +424,103 @@ def cert_panel(flow: Flow) -> Panel:
         g.add_row("Findings", badges)
     return Panel(g, title=f"TLS · flow {flow.id}", title_align="left", border_style="gold1")
 
+
+
+def _alert_text(c) -> Text:
+    t = Text()
+    for sev in ("high", "medium", "low"):
+        if c[sev]:
+            t.append(f"{c[sev]}{sev[0].upper()} ", style=SEV_STYLE[sev])
+    t.rstrip()
+    return t
+
+
+def _host_name(h) -> Text:
+    t = Text(h.addr, style="bold" if h.local else "")
+    if h.name:
+        t.append(f"\n{h.name}", style="grey70")
+    if h.mac and not h.routed:
+        t.append(f"\n{h.mac}", style="grey50")
+    return t
+
+
+def hosts_table(hosts: list, limit: int | None = None, width: int | None = None) -> Table:
+    width = width or console.width
+    wide = width >= 110
+    # rich can overshoot by a column or two when it has to squeeze many folding columns, so leave slack
+    t = Table(title=f"Hosts ({len(hosts)})", box=box.SIMPLE_HEAVY, header_style="bold",
+              expand=wide, width=None if wide else width - 3)
+    t.add_column("Host", overflow="fold", min_width=18, max_width=25)
+    if wide:
+        t.add_column("OS guess", overflow="fold", max_width=14)
+    t.add_column("Role", overflow="fold", max_width=24)
+    t.add_column("Ports", style="green3", overflow="fold")
+    if wide:
+        t.add_column("Uses", overflow="fold", style="grey70", max_width=28)
+    t.add_column("Sent / recv", justify="right", no_wrap=True)
+    t.add_column("Alerts", max_width=9)
+    t.add_column("Risk", justify="right", no_wrap=True, min_width=4)
+    for h in hosts[:limit] if limit else hosts:
+        roles = Text()
+        for i, r in enumerate(h.roles):
+            style = "bold red" if r == "scanner" else "grey50" if r in ("external", "passive") else "cyan"
+            roles.append((", " if i else "") + r, style=style)
+        uses = ", ".join(f"{k}" + (f"×{v}" if v > 1 else "") for k, v in h.uses.most_common(4))
+        risk = h.max_risk
+        name = _host_name(h)
+        if not wide and h.os:
+            name.append(f"\n{h.os}", style="grey62 italic")
+        cells = [name] + ([h.os] if wide else []) + [roles, ", ".join(map(str, h.open_ports[:8]))] + \
+            ([uses] if wide else [])
+        t.add_row(*cells, f"{human_bytes(h.bytes_sent)}\n{human_bytes(h.bytes_recv)}", _alert_text(h.alerts_caused),
+                  Text(str(risk) if risk else "", style=RISK_STYLE[level_for(risk)]))
+    return t
+
+
+def host_panel(h, t0: float | None = None) -> Panel:
+    """Everything known about one address."""
+    t0 = t0 or h.first_ts
+    rows = Table.grid(padding=(0, 2))
+    rows.add_column(style="grey62", no_wrap=True)
+    rows.add_column(overflow="fold")
+
+    def row(label, value):
+        if value:
+            rows.add_row(label, value)
+
+    row("Names", ", ".join(f"{n} [grey50]({src})[/]" for n, src in list(h.names.items())[:6]))
+    row("MAC", ", ".join(h.macs) + (" [grey50](router's MAC; host is off-link)[/]" if h.routed else ""))
+    row("OS guess", h.os + (f" [grey50](TTL {h.syn['ttl']}, window {h.syn['window']}, "
+                            f"options {h.syn['options'] or 'none'})[/]" if h.syn else ""))
+    row("Role", ", ".join(h.roles))
+    row("Seen", f"{h.first_ts - t0:.3f}s → {h.last_ts - t0:.3f}s")
+    row("Traffic", f"sent {h.pkts_sent} pkts / {human_bytes(h.bytes_sent)}, "
+                   f"received {h.pkts_recv} pkts / {human_bytes(h.bytes_recv)}, "
+                   f"{h.flows_out} outbound and {h.flows_in} inbound conversations")
+    if h.services:
+        row("Services", "\n".join(f"[green3]{k}[/] {v['label']} [grey50]← {len(v['clients'])} client(s), "
+                                  f"{v['flows']} conn, {human_bytes(v['bytes'])}[/]"
+                                  for k, v in sorted(h.services.items(), key=lambda kv: int(kv[0].split('/')[0]))))
+    if h.closed_ports:
+        ports = sorted(h.closed_ports)
+        row("Closed ports", ", ".join(map(str, ports[:20])) + (f" … (+{len(ports) - 20})" if len(ports) > 20 else ""))
+    row("Uses", ", ".join(f"{k} ×{v}" for k, v in h.uses.most_common(10)))
+    row("Peers", ", ".join(f"{p} [grey50]{human_bytes(b)}[/]" for p, b in h.peers.most_common(6)))
+    if h.domains:
+        row("DNS lookups", "\n".join(f"{d}" + (f" ×{n}" if n > 1 else "") for d, n in h.domains.most_common(10))
+            + (f"\n[yellow3]{h.nxdomains} NXDOMAIN answer(s)[/]" if h.nxdomains else ""))
+    row("TLS SNI", ", ".join(h.sni))
+    row("HTTP hosts", ", ".join(h.http_hosts))
+    row("User-Agents", "\n".join(h.user_agents))
+    if h.alerts_caused or h.alerts_targeted:
+        row("Alerts", Text.assemble("caused ", _alert_text(h.alerts_caused) or Text("none", style="grey50"),
+                                    "  targeted by ", _alert_text(h.alerts_targeted) or Text("none", style="grey50")))
+        row("Rules", ", ".join(sorted(h.rules)))
+    if h.max_risk:
+        row("Riskiest flow", Text(f"{h.max_risk}/100", style=RISK_STYLE[level_for(h.max_risk)]))
+    border = "red3" if h.alerts_caused["high"] else "dark_orange" if h.alerts_caused else "grey50"
+    title = f"[bold]{h.addr}[/]" + (f"  [grey62]{h.name}[/]" if h.name else "")
+    return Panel(rows, title=title, title_align="left", border_style=border)
 
 def risk_table(flows: list[Flow], limit: int | None = None, show_all: bool = False) -> Table:
     t = Table(title="Conversation risk", box=box.SIMPLE_HEAVY, header_style="bold", expand=True,

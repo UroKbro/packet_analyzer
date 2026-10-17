@@ -100,6 +100,17 @@ def dns_response(ident: int, name: str, answers: list[tuple[int, bytes]], qtype:
     return msg
 
 
+def dhcp(op: int, msg_type: int, client_mac: str, xid: int = 0x1234, your_ip: str = "0.0.0.0",
+         hostname: str | None = None) -> bytes:
+    """BOOTP header + magic cookie + options (53 message type, 12 hostname)."""
+    body = struct.pack("!BBBBIHH", op, 1, 6, 0, xid, 0, 0) + bytes(4) + socket.inet_aton(your_ip) + bytes(8)
+    body += mac(client_mac) + bytes(10) + bytes(64 + 128) + b"\x63\x82\x53\x63"
+    opts = bytes([53, 1, msg_type])
+    if hostname:
+        opts += bytes([12, len(hostname)]) + hostname.encode()
+    return body + opts + b"\xff"
+
+
 def tcp_mss_options(mss: int = 1460, wscale: int = 7) -> bytes:
     return struct.pack("!BBH", 2, 4, mss) + b"\x01" + struct.pack("!BBB", 3, 3, wscale) + b"\x04\x02\x00\x00"
 
