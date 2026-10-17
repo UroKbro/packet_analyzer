@@ -48,6 +48,7 @@ class Snapshot:
 
 
 def snapshot(an, path: str = "") -> Snapshot:
+    an.finish()
     score_flows(an)
     s = Snapshot(path, an.count, an.bytes, (an.last_ts or 0) - (an.first_ts or 0), len(an.flows),
                  Counter(an.top_protocol), Counter(an.talkers))

@@ -110,6 +110,27 @@ RULES: dict[str, tuple[str, str, str]] = {
                      "Inspect the raw handshake; it may be corrupted or deliberately malformed."),
     "tls-handshake-failed": ("TLS handshake failed", "One side aborted the handshake with a fatal alert, often "
                              "because it rejected the certificate.", "Look at the alert reason and the certificate."),
+    "beaconing": ("Beaconing",
+                  "A host contacted the same destination on a steady timer. Malware checks in with its command-and-"
+                  "control server this way to fetch instructions; people and most software don't keep such a rhythm.",
+                  "Identify the process making the connections on the host, check the destination's reputation, and "
+                  "block it if it's unknown. Regular jobs (updates, monitoring agents) can be allow-listed."),
+    "exfiltration": ("Possible data exfiltration",
+                     "Far more data left the host than came back, to a single destination. That is the shape of a "
+                     "file being stolen, especially when the upload is encrypted or compressed on a plain port.",
+                     "Find out what was sent: check the destination, the process and any files touched around that "
+                     "time. Treat the data as exposed until shown otherwise."),
+    "long-encrypted-session": ("Long-lived encrypted upload",
+                               "An encrypted session stayed open for a long time and sent more than it received, "
+                               "which can be a slow, quiet leak.",
+                               "Confirm the destination and the application that holds the session open."),
+    "dns-exfiltration": ("DNS exfiltration",
+                         "Data was smuggled out inside DNS names: many unique, random-looking subdomains under one "
+                         "domain. DNS is often allowed everywhere, which makes it a favourite covert channel.",
+                         "Block the domain at the resolver, find the process on the host and work out what was "
+                         "encoded."),
+    "icmp-tunnel": ("ICMP tunnel", "Large amounts of data travelled inside ping packets, a known covert channel.",
+                    "Limit ICMP payload sizes at the edge and inspect the sending host."),
 }
 
 

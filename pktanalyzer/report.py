@@ -200,6 +200,7 @@ def bars(rows: list[tuple[str, float, str]], color: str = "var(--accent)") -> st
 
 # -- the report -------------------------------------------------------------------
 def build_report(an: Analyzer, source: str) -> str:
+    an.finish()
     risky = score_flows(an)
     groups = explain.group(an.alerts)
     hosts = suspicious_hosts(an)
@@ -236,7 +237,7 @@ def build_report(an: Analyzer, source: str) -> str:
         lat = f"{e.duration * 1000:.1f} ms" if e.duration is not None else ""
         color = SEV_COLOR["high"] if e.level == "bad" else SEV_COLOR["medium"] if e.level == "warn" else "inherit"
         rows.append(f'<tr><td class="num mono">{e.ts - t0:.4f}</td><td>{_badge(e.kind, KIND_COLOR[e.kind])}</td>'
-                    f'<td style="color:{color}">{_e(e.title)}</td><td class="muted">{_e(e.detail)}</td>'
+                    f'<td class="wrap" style="color:{color}">{_e(e.title)}</td><td class="muted wrap">{_e(e.detail)}</td>'
                     f'<td class="num">{lat}</td><td class="num">{_e(e.flow if e.flow is not None else "")}</td></tr>')
     more = f'<p class="muted">Showing 400 of {len(events)} events.</p>' if len(events) > 400 else ""
     section("timeline", "Timeline",
@@ -261,6 +262,31 @@ def build_report(an: Analyzer, source: str) -> str:
         section("alerts", f"Alerts explained ({len(an.alerts)})", f'<div class="cards">{"".join(cards)}</div>')
     else:
         section("alerts", "Alerts explained", '<p class="muted">No alerts were raised.</p>')
+
+    if an.findings:
+        titles = {"beaconing": "Beaconing", "exfiltration": "Data exfiltration", "long-session": "Long encrypted session",
+                  "dns-exfiltration": "DNS exfiltration", "icmp-tunnel": "ICMP tunnel"}
+        cards = []
+        for x in an.findings:
+            color = SEV_COLOR[x.severity]
+            strip = ""
+            if x.series:
+                w, h = 320, 44
+                span = max(t1 - t0, 1e-9)
+                ticks = "".join(f'<line x1="{(ts - t0) / span * (w - 2) + 1:.1f}" y1="4" '
+                                f'x2="{(ts - t0) / span * (w - 2) + 1:.1f}" y2="{h - 12}" stroke="{color}" '
+                                f'stroke-width="2"/>' for ts, _ in x.series)
+                strip = (f'<svg viewBox="0 0 {w} {h}" width="100%" style="max-width:{w}px;display:block;margin:6px 0">'
+                         f'<line x1="0" y1="{h - 12}" x2="{w}" y2="{h - 12}" stroke="currentColor" opacity=".25"/>'
+                         f'{ticks}<text x="0" y="{h - 1}">0s</text><text x="{w}" y="{h - 1}" text-anchor="end">'
+                         f'{t1 - t0:.0f}s</text></svg>')
+            ev = "".join(f"<li>{_e(e)}</li>" for e in x.evidence)
+            cards.append(f'<div class="card" style="--c:{color}"><h3>{_e(titles.get(x.kind, x.kind))} '
+                         f'{_badge(x.severity, color)} <span class="muted">score {x.score}/100</span></h3>'
+                         f'<p>{_e(x.summary)}</p>{strip}<ul>{ev}</ul>'
+                         f'<p class="muted">{x.first_ts - t0:.1f}s → {x.last_ts - t0:.1f}s · flows '
+                         f'{_e(", ".join(map(str, x.flows[:10])))}{" …" if len(x.flows) > 10 else ""}</p></div>')
+        section("hunt", f"Beaconing & exfiltration ({len(an.findings)})", f'<div class="cards">{"".join(cards)}</div>')
 
     if hosts:
         rows = []

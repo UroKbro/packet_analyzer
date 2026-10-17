@@ -30,6 +30,7 @@ def _analyze(path: str, keep: bool = True, checksums: bool = True) -> Analyzer:
     with con.status(f"[cyan]Decoding {os.path.basename(path)}…", spinner="dots"):
         for _ in an.run(open_capture(path)):
             pass
+        an.finish()
     return an
 
 
@@ -154,6 +155,15 @@ def cmd_diff(args) -> None:
         con.print(f"[grey50]Differences written to {args.json}")
 
 
+def cmd_hunt(args) -> None:
+    an = _analyze(args.file, keep=False)
+    findings = [x for x in an.findings if x.score >= args.min]
+    con.print(ui.hunt_view(findings, an.first_ts or 0, an.last_ts or 0, con.width))
+    hidden = len(an.findings) - len(findings)
+    if hidden:
+        con.print(f"[grey50]{hidden} weaker pattern(s) below score {args.min} hidden; use --min 0 to see them.")
+
+
 def cmd_tls(args) -> None:
     an = _analyze(args.file, keep=False)
     flows = [f for f in an.flows if f.tls or f.tls_sni]
@@ -199,6 +209,11 @@ def cmd_export(args) -> None:
 
 
 def cmd_sample(args) -> None:
+    if args.c2:
+        from .craft import write_c2_sample
+        n = write_c2_sample(args.out)
+        con.print(f"[green3]Wrote {n} packets to [bold]{args.out}[/]. Try:[/]\n  python -m pktanalyzer hunt {args.out}")
+        return
     n = write_sample(args.out, baseline=args.baseline)
     con.print(f"[green3]Wrote {n} packets to [bold]{args.out}[/]. Try:[/]")
     if args.baseline:
@@ -369,6 +384,11 @@ def build_parser() -> argparse.ArgumentParser:
     df.add_argument("--json", metavar="FILE", help="also write the differences as JSON")
     df.set_defaults(func=cmd_diff)
 
+    hu = sub.add_parser("hunt", help="look for beaconing (C2 check-ins) and data exfiltration")
+    hu.add_argument("file")
+    hu.add_argument("--min", type=int, default=45, help="minimum score to show (default 45)")
+    hu.set_defaults(func=cmd_hunt)
+
     ts_ = sub.add_parser("tls", help="TLS sessions: SNI, version, cipher suite and certificate details")
     ts_.add_argument("file")
     ts_.add_argument("--certs", action="store_true", help="print every certificate chain in full")
@@ -411,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sa = sub.add_parser("sample", help="generate a demo pcap with normal traffic and attacks")
     sa.add_argument("--baseline", action="store_true", help="write the same network on a quiet day (for diff)")
+    sa.add_argument("--c2", action="store_true", help="write a compromised host: beaconing and exfiltration (for hunt)")
     sa.add_argument("out", nargs="?", default="sample.pcap")
     sa.set_defaults(func=cmd_sample)
 

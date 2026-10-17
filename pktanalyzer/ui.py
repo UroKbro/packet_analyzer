@@ -1099,3 +1099,46 @@ def diff_view(d: dict) -> Group:
     table("Bandwidth per host (bytes sent per second)", ["Host", "Before", "After"],
           [(b["host"], f"{b['before']:,} B/s", f"{b['after']:,} B/s") for b in d["bandwidth"]])
     return Group(*parts)
+
+
+# -- behavioural hunting -------------------------------------------------------
+HUNT_TITLE = {"beaconing": "Beaconing", "exfiltration": "Data exfiltration", "long-session": "Long encrypted session",
+              "dns-exfiltration": "DNS exfiltration", "icmp-tunnel": "ICMP tunnel"}
+
+
+def beacon_strip(series: list, t0: float, t1: float, width: int = 60) -> Text:
+    """One tick per check-in on a shared time axis; regular spacing is the giveaway."""
+    cells = [" "] * width
+    span = max(t1 - t0, 1e-9)
+    for ts, _ in series:
+        cells[min(width - 1, int((ts - t0) / span * (width - 1)))] = "┃"
+    return Text("".join(cells), style="red3")
+
+
+def hunt_view(findings: list, t0: float, t1: float, width: int = 100) -> Group:
+    if not findings:
+        return Group(Panel(Text("No beaconing or exfiltration patterns found.", style="green3"),
+                           border_style="green3"))
+    parts = []
+    for x in findings:
+        sev = x.severity
+        body = Text()
+        body.append(x.summary + "\n", style="bold")
+        for e in x.evidence:
+            body.append(f"  • {e}\n")
+        body.append(f"  seen {x.first_ts - t0:.1f}s → {x.last_ts - t0:.1f}s", style="grey62")
+        if x.flows:
+            body.append(f"   flows {', '.join(map(str, x.flows[:8]))}" + (" …" if len(x.flows) > 8 else ""),
+                        style="cyan")
+        items = [body]
+        if x.series:
+            strip_w = max(20, min(80, width - 16))
+            items += [Text(""), Text.assemble(("  check-ins ", "grey62"), beacon_strip(x.series, t0, t1, strip_w))]
+            gaps = [b[0] - a[0] for a, b in zip(x.series, x.series[1:])]
+            items.append(Text.assemble(("  gaps (s)  ", "grey62"),
+                                       (" ".join(f"{g:.0f}" for g in gaps[:24]), "grey70")))
+        title = Text.assemble((f"{SEV_ICON[sev]} {HUNT_TITLE.get(x.kind, x.kind)}", SEV_STYLE[sev]),
+                              (f"  score {x.score}/100", "bold"))
+        parts.append(Panel(Group(*items), title=title, title_align="left",
+                           border_style=SEV_STYLE[sev].replace("bold ", "")))
+    return Group(*parts)

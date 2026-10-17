@@ -445,3 +445,81 @@ def _tls_sessions(sc: Scenario, me: str, me_mac: str, gw: str, gw_mac: str, site
             sess.server_send(tls_record(22, flight, 0x0301))
             sess.client_send(tls_record(21, b"\x02\x2a", 0x0301))  # fatal bad_certificate: the client gave up
         sess.close()
+
+
+def write_c2_sample(path: str, seed: int = 11) -> int:
+    """A compromised workstation over ~12 minutes: a jittered HTTPS beacon, DNS exfiltration and a bulk upload,
+    hidden among irregular browsing and a perfectly periodic (and harmless) NTP client."""
+    random.seed(seed)
+    sc = Scenario()
+    me, gw = "10.0.0.42", "10.0.0.1"
+    me_mac, gw_mac = "3c:22:fb:aa:bb:42", "00:1a:2b:3c:4d:5e"
+    eth = lambda s, d, p: ethernet(s, d, 0x0800, p)
+    events: list[tuple[float, str, object]] = []
+    start = sc.t
+
+    for i in range(12):   # beacon: every 60 s with +-3 s jitter, one check-in skipped
+        if i != 7:
+            events.append((start + 5 + i * 60 + random.uniform(-3, 3), "beacon", i))
+    for i in range(11):   # NTP every 64 s: periodic, but a known-good protocol
+        events.append((start + 2 + i * 64, "ntp", i))
+    for i, site in enumerate(("news.example.com", "mail.example.com", "docs.example.org", "shop.example.net",
+                              "video.example.com", "wiki.example.org")):
+        events.append((start + random.uniform(10, 700), "browse", (i, site)))
+    events.append((start + 300, "dnsexfil", None))
+    events.append((start + 540, "upload", None))
+
+    port = 50000
+    for ts, kind, arg in sorted(events, key=lambda e: e[0]):
+        sc.t = max(sc.t, ts)
+        port += 1
+        if kind == "beacon":
+            s = TcpSession(sc, me_mac, gw_mac, me, "198.51.100.77", port, 443, rtt=0.045)
+            s.handshake()
+            s.client_send(tls_client_hello("sync.cdn-telemetry.example"))
+            s.server_send(tls_record(22, tls_server_hello(0x1301, tls13=True)) + tls_record(20, b"\x01")
+                          + tls_record(23, random.randbytes(180 + random.randint(0, 12))))
+            s.client_send(tls_record(23, random.randbytes(96 + random.randint(0, 8))))
+            s.close()
+        elif kind == "ntp":
+            pkt = bytes([0x23]) + bytes(47)
+            sc.add(eth(me_mac, gw_mac, ipv4(me, "129.6.15.28", 17, udp(me, "129.6.15.28", 123, 123, pkt))), 0.001)
+            sc.add(eth(gw_mac, me_mac, ipv4("129.6.15.28", me, 17, udp("129.6.15.28", me, 123, 123,
+                                                                        bytes([0x24]) + bytes(47)), ttl=52)), 0.03)
+        elif kind == "browse":
+            i, site = arg
+            ip = f"93.184.216.{40 + i}"
+            ident = 0x7000 + i
+            sc.add(eth(me_mac, gw_mac, ipv4(me, gw, 17, udp(me, gw, port, 53, dns_query(ident, site)))), 0.001)
+            sc.add(eth(gw_mac, me_mac, ipv4(gw, me, 17, udp(gw, me, 53, port, dns_response(
+                ident, site, [(1, socket.inet_aton(ip))])))), 0.012)
+            s = TcpSession(sc, me_mac, gw_mac, me, ip, port + 1000, 443, rtt=0.03)
+            s.handshake()
+            s.client_send(tls_client_hello(site))
+            s.server_send(tls_record(22, tls_server_hello(0x1302, tls13=True)) + tls_record(20, b"\x01")
+                          + tls_record(23, random.randbytes(random.randint(3000, 30000))))
+            s.client_send(tls_record(23, random.randbytes(random.randint(200, 900))))
+            s.close()
+        elif kind == "dnsexfil":
+            secret = random.randbytes(1200)
+            alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+            encoded = "".join(alphabet[b & 31] for b in secret)  # base32-ish
+            for n, off in enumerate(range(0, len(encoded), 50)):
+                name = f"{encoded[off:off + 50]}.{n}.x.data-drop.example"
+                ident = 0x8000 + n
+                sc.add(eth(me_mac, gw_mac, ipv4(me, gw, 17, udp(me, gw, 40000 + n, 53, dns_query(ident, name, 16)))),
+                       0.15)
+                sc.add(eth(gw_mac, me_mac, ipv4(gw, me, 17, udp(gw, me, 53, 40000 + n, dns_response(
+                    ident, name, [], 16, rcode=3)))), 0.02)
+        elif kind == "upload":
+            body = random.randbytes(320 * 1024)
+            s = TcpSession(sc, me_mac, gw_mac, me, "203.0.113.99", port, 8080, rtt=0.06)
+            s.handshake()
+            s.client_send(b"POST /upload/b64 HTTP/1.1\r\nHost: 203.0.113.99:8080\r\nUser-Agent: python-requests/2.31\r\n"
+                          b"Content-Type: application/octet-stream\r\nContent-Length: "
+                          + str(len(body)).encode() + b"\r\n\r\n")
+            for off in range(0, len(body), 1400):
+                s.client_send(body[off:off + 1400], dt=0.0008)
+            s.server_send(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok")
+            s.close()
+    return sc.write(path)

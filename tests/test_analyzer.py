@@ -11,7 +11,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, diff, dns, explain, filters, hosts, report, scoring, timeline, tls, x509  # noqa: E402
+from pktanalyzer import (craft, diff, dns, explain, filters, hosts, hunt, report, scoring, timeline,  # noqa: E402
+                         tls, x509)
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -532,6 +533,78 @@ class TestDiff(unittest.TestCase):
             self.assertFalse(same[k], k)
 
 
+class TestHunt(unittest.TestCase):
+    @staticmethod
+    def _analyze(path):
+        an = Analyzer(keep_packets=False)
+        for _ in an.run(open_capture(path)):
+            pass
+        return an
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c2.pcap")
+            craft.write_c2_sample(path)
+            cls.an = cls._analyze(path)
+        cls.findings = cls.an.finish()
+
+    def test_c2_sample(self):
+        by_kind = {x.kind: x for x in self.findings}
+        self.assertEqual(set(by_kind), {"beaconing", "exfiltration", "dns-exfiltration"})
+        b = by_kind["beaconing"]
+        self.assertIn("198.51.100.77:443", b.target)
+        self.assertIn("sync.cdn-telemetry.example", b.target)
+        self.assertEqual(len(b.series), 11)  # one of the 12 check-ins was skipped and must not break the rhythm
+        self.assertGreaterEqual(b.score, 80)
+        self.assertTrue(any("missed" in e for e in b.evidence))
+        self.assertEqual(by_kind["exfiltration"].target, "203.0.113.99:8080")
+        self.assertEqual(by_kind["dns-exfiltration"].target, "data-drop.example")
+        # NTP is perfectly periodic but harmless; browsing is irregular
+        self.assertFalse([x for x in self.findings if "129.6.15.28" in x.target or "93.184.216" in x.target])
+        rules = [a.rule for a in self.an.alerts]
+        self.assertEqual(rules.count("beaconing"), 1)
+        self.an.finish()  # idempotent
+        self.assertEqual([a.rule for a in self.an.alerts].count("beaconing"), 1)
+        scoring.score_flows(self.an)
+        exfil_flow = self.an.tracker.by_id[by_kind["exfiltration"].flows[0]]
+        self.assertGreaterEqual(exfil_flow.risk.score, 40)  # the hunt's alert feeds the flow's risk
+
+    def test_no_false_positives_on_attack_sample(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            self.assertEqual(self._analyze(path).finish(), [])
+
+    def test_periodicity(self):
+        import random
+        rng = random.Random(1)
+        regular = [i * 30 + rng.uniform(-1, 1) for i in range(15)]
+        p = hunt.periodicity(regular)
+        self.assertAlmostEqual(p["period"], 30, delta=1.5)
+        self.assertLess(p["cv"], 0.1)
+        self.assertGreaterEqual(hunt.beacon_score(p, [500] * 15, 15), 80)
+        irregular = sorted(rng.uniform(0, 3000) for _ in range(15))
+        q = hunt.periodicity(irregular)
+        self.assertTrue(q is None or hunt.beacon_score(q, [], 15) < 60 or q["consistent"] < 0.6)
+        self.assertIsNone(hunt.periodicity([0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]))  # streaming, not beaconing
+        self.assertIsNone(hunt.periodicity([0, 60, 120]))                      # too few to judge
+
+    def test_dns_beacon_and_base_domain(self):
+        self.assertEqual(hunt.base_domain("a.b.evil.co.uk"), "evil.co.uk")
+        self.assertEqual(hunt.base_domain("x.y.example.com."), "example.com")
+        an = Analyzer()
+        for i in range(10):
+            q = craft.dns_query(i, "check.update-svc.example")
+            fr = craft.ethernet(MA, MB, 0x0800, craft.ipv4(A, B, 17, craft.udp(A, B, 30000 + i, 53, q)))
+            an.feed(Frame(1000.0 + i * 300 + (i % 3), fr, LINKTYPE_ETHERNET, len(fr)))
+        found = hunt.find_beacons(an)
+        self.assertEqual([(x.kind, x.target) for x in found], [("beaconing", "check.update-svc.example")])
+
+    def test_rules_explained(self):
+        self.assertFalse(set(hunt.RULE_FOR.values()) - set(explain.RULES))
+
+
 class TestReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -594,6 +667,8 @@ class TestCLI(unittest.TestCase):
                          ["hosts", path], ["hosts", path, "10.0.0.23"], ["hosts", path, "--all", "-n", "3"],
                          ["sample", "--baseline", os.path.join(d, "b.pcap")],
                          ["diff", os.path.join(d, "b.pcap"), path, "--json", os.path.join(d, "d.json")],
+                         ["sample", "--c2", os.path.join(d, "c2.pcap")], ["hunt", os.path.join(d, "c2.pcap")],
+                         ["hunt", path],
                          ["report", path, "-o", os.path.join(d, "r.html")],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)

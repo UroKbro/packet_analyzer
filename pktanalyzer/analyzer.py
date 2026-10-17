@@ -35,6 +35,7 @@ class Analyzer:
         self.talkers: Counter = Counter()       # bytes sent per address
         self.conversations: Counter = Counter()  # bytes per address pair
         self.timeline: dict[int, int] = defaultdict(int)  # packets per 100 ms bucket
+        self.findings: list | None = None  # beaconing/exfiltration, filled by finish()
 
     def feed(self, frame: Frame) -> Packet:
         self.count += 1
@@ -63,6 +64,14 @@ class Analyzer:
         self.talkers[src] += pkt.orig_len
         self.conversations[tuple(sorted((src, dst)))] += pkt.orig_len
         self.timeline[int((pkt.ts - self.first_ts) * 10)] += 1
+
+    def finish(self) -> list:
+        """Run the whole-capture hunts (beaconing, exfiltration) once and add their alerts."""
+        if self.findings is None:
+            from .hunt import detect, to_alerts
+            self.findings = detect(self)
+            self.detector.alerts.extend(to_alerts(self.findings))
+        return self.findings
 
     @property
     def flows(self):
