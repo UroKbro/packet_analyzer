@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from . import __version__, explain, hosts, report, scoring, timeline, ui
+from . import __version__, diff, explain, hosts, report, scoring, timeline, ui
 from .analyzer import Analyzer
 from .capture import CaptureError, default_interface, list_interfaces, live_frames
 from .craft import write_sample
@@ -144,6 +144,16 @@ def cmd_hosts(args) -> None:
     con.print("[grey50]Run [bold]hosts FILE ADDRESS[/] for the full profile of one host.")
 
 
+def cmd_diff(args) -> None:
+    d = diff.diff_files(args.before, args.after, lambda p: _analyze(p, keep=False))
+    con.print(ui.diff_view(d))
+    if args.json:
+        import json
+        with open(args.json, "w") as f:
+            json.dump(d, f, indent=2, default=str)
+        con.print(f"[grey50]Differences written to {args.json}")
+
+
 def cmd_tls(args) -> None:
     an = _analyze(args.file, keep=False)
     flows = [f for f in an.flows if f.tls or f.tls_sni]
@@ -189,8 +199,11 @@ def cmd_export(args) -> None:
 
 
 def cmd_sample(args) -> None:
-    n = write_sample(args.out)
+    n = write_sample(args.out, baseline=args.baseline)
     con.print(f"[green3]Wrote {n} packets to [bold]{args.out}[/]. Try:[/]")
+    if args.baseline:
+        con.print(f"  python -m pktanalyzer sample after.pcap && python -m pktanalyzer diff {args.out} after.pcap")
+        return
     for c in ("read", "stats", "flows", "alerts", "live -r"):
         con.print(f"  python -m pktanalyzer {c} {args.out}")
     con.print(f"  python -m pktanalyzer follow {args.out} 2")
@@ -350,6 +363,12 @@ def build_parser() -> argparse.ArgumentParser:
     ho.add_argument("--all", action="store_true", help="include idle external hosts")
     ho.set_defaults(func=cmd_hosts)
 
+    df = sub.add_parser("diff", help="compare two captures: new/missing flows, DNS, TLS, alerts, ports, bandwidth")
+    df.add_argument("before")
+    df.add_argument("after")
+    df.add_argument("--json", metavar="FILE", help="also write the differences as JSON")
+    df.set_defaults(func=cmd_diff)
+
     ts_ = sub.add_parser("tls", help="TLS sessions: SNI, version, cipher suite and certificate details")
     ts_.add_argument("file")
     ts_.add_argument("--certs", action="store_true", help="print every certificate chain in full")
@@ -391,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
         c.set_defaults(func=func)
 
     sa = sub.add_parser("sample", help="generate a demo pcap with normal traffic and attacks")
+    sa.add_argument("--baseline", action="store_true", help="write the same network on a quiet day (for diff)")
     sa.add_argument("out", nargs="?", default="sample.pcap")
     sa.set_defaults(func=cmd_sample)
 

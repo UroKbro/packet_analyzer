@@ -215,7 +215,7 @@ class Scenario:
     """Accumulates timestamped frames and writes them out as a pcap."""
 
     def __init__(self, start: float = 1_760_000_000.0):
-        self.t = start
+        self.start = self.t = start
         self.frames: list[tuple[float, bytes]] = []
 
     def add(self, frame: bytes, dt: float = 0.001) -> None:
@@ -287,8 +287,12 @@ class TcpSession:
         self._c(ACK, dt=self.rtt / 2)
 
 
-def write_sample(path: str, seed: int = 7) -> int:
-    """Write the demo capture; returns the number of packets written."""
+def write_sample(path: str, seed: int = 7, baseline: bool = False) -> int:
+    """Write the demo capture; returns the number of packets written.
+
+    ``baseline=True`` writes the same network on a quiet day (no attacker, no phishing site, a clean
+    link and an older DNS answer for github.com), for trying out ``diff``.
+    """
     random.seed(seed)
     sc = Scenario()
     me, gw, srv = "10.0.0.23", "10.0.0.1", "93.184.216.34"
@@ -312,7 +316,8 @@ def write_sample(path: str, seed: int = 7) -> int:
     body = (b"<!doctype html><html><head><title>Example Domain</title></head><body>"
             + b"<p>This domain is for use in illustrative examples in documents.</p>" * 60 + b"</body></html>")
     s.server_send(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\nServer: ECS (nyb/1D2E)\r\n"
-                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body, reorder=True, retransmit=True)
+                  b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body,
+                  reorder=not baseline, retransmit=not baseline)
     s.client_send(b"GET /favicon.ico HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8.4.0\r\n\r\n")
     s.server_send(b"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n"
                   b"9\r\nNot found\r\n0\r\n\r\n")
@@ -320,9 +325,10 @@ def write_sample(path: str, seed: int = 7) -> int:
 
     # 3. HTTPS: DNS AAAA + A, TLS ClientHello with SNI
     sc.add(eth(me_mac, gw_mac, ipv4(me, gw, 17, udp(me, gw, 53125, 53, dns_query(0x2b3c, "github.com")))), 0.05)
+    gh = "140.82.112.4" if baseline else "140.82.112.3"
     sc.add(eth(gw_mac, me_mac, ipv4(gw, me, 17, udp(gw, me, 53, 53125, dns_response(
-        0x2b3c, "github.com", [(1, socket.inet_aton("140.82.112.3"))])))), 0.009)
-    t = TcpSession(sc, me_mac, gw_mac, me, "140.82.112.3", 51560, 443, rtt=0.031)
+        0x2b3c, "github.com", [(1, socket.inet_aton(gh))])))), 0.009)
+    t = TcpSession(sc, me_mac, gw_mac, me, gh, 51560, 443, rtt=0.031)
     t.handshake()
     t.client_send(tls_client_hello("github.com"))
     # TLS 1.3: only the ServerHello is readable; the certificate travels encrypted
@@ -345,6 +351,10 @@ def write_sample(path: str, seed: int = 7) -> int:
     sc.add(ethernet(me_mac, gw_mac, 0x86DD, ipv6("fe80::1c22:fbff:fe12:3456", "fe80::1",
                                                  17, udp("fe80::1c22:fbff:fe12:3456", "fe80::1", 53999, 53,
                                                          dns_query(0x3c4d, "ipv6.google.com", 28)))), 0.05)
+
+    if baseline:
+        _tls_sessions(sc, me, me_mac, gw, gw_mac, [(0x5e6f, "api.example.com", "198.51.100.20", 51720)])
+        return sc.write(path)
 
     # --- the attacker shows up ------------------------------------------------
     # 6. SYN port scan of the host: closed ports answer RST, port 22 answers SYN-ACK
@@ -397,16 +407,24 @@ def write_sample(path: str, seed: int = 7) -> int:
     sc.add(eth(me_mac, gw_mac, ipv4(me, "10.0.0.50", 6, tcp(me, "10.0.0.50", 51600, 9000, 777, 0, SYN))), 0.1)
     sc.add(eth(gw_mac, me_mac, ipv4("10.0.0.50", me, 6, tcp("10.0.0.50", me, 9000, 51600, 0, 778, RST | ACK))), 0.001)
     # 13. Two TLS 1.2 sessions whose certificates travel in the clear
+    _tls_sessions(sc, me, me_mac, gw, gw_mac, [(0x5e6f, "api.example.com", "198.51.100.20", 51720),
+                                               (0x6f70, "login.paypa1-secure.com", "203.0.113.50", 51730)])
+    return sc.write(path)
+
+
+def _tls_sessions(sc: Scenario, me: str, me_mac: str, gw: str, gw_mac: str, sites: list) -> None:
+    eth = lambda s, d, p: ethernet(s, d, 0x0800, p)
     day = 86400.0
-    now = sc.t
-    for ident, name, ip, port in ((0x5e6f, "api.example.com", "198.51.100.20", 51720),
-                                  (0x6f70, "login.paypa1-secure.com", "203.0.113.50", 51730)):
+    now = sc.start + 2.4  # fixed, so a site presents the same certificate in every generated capture
+    for ident, name, ip, port in sites:
         sc.add(eth(me_mac, gw_mac, ipv4(me, gw, 17, udp(me, gw, port + 1, 53, dns_query(ident, name)))), 0.2)
         sc.add(eth(gw_mac, me_mac, ipv4(gw, me, 17, udp(gw, me, 53, port + 1, dns_response(
             ident, name, [(1, socket.inet_aton(ip))])))), 0.015)
         sess = TcpSession(sc, me_mac, gw_mac, me, ip, port, 443, rtt=0.04)
         sess.handshake()
         sess.client_send(tls_client_hello(name))
+        state = random.getstate()
+        random.seed(ident)  # the same key material for this site in every capture
         if name == "api.example.com":
             ca = {"C": "US", "O": "Example Trust Services", "CN": "Example Issuing CA R3"}
             leaf = make_certificate({"CN": "api.example.com"}, ca, now - 30 * day, now + 60 * day,
@@ -414,6 +432,7 @@ def write_sample(path: str, seed: int = 7) -> int:
             inter = make_certificate(ca, {"C": "US", "O": "Example Trust Services", "CN": "Example Root CA"},
                                      now - 900 * day, now + 900 * day, [], ca=True, serial=0x77)
             flight = tls_server_hello(0xC02F) + tls_certificate_msg([leaf, inter]) + tls_handshake(14, b"")
+            random.setstate(state)
             sess.server_send(tls_record(22, flight))
             sess.client_send(tls_record(22, tls_handshake(16, random.randbytes(66))) + tls_record(20, b"\x01")
                              + tls_record(23, random.randbytes(40)))
@@ -422,7 +441,7 @@ def write_sample(path: str, seed: int = 7) -> int:
             leaf = make_certificate({"O": "Dev", "CN": "localhost"}, {"O": "Dev", "CN": "localhost"},
                                     now - 400 * day, now - 35 * day, ["localhost"], serial=1)
             flight = tls_server_hello(0x0005, version=0x0301) + tls_certificate_msg([leaf]) + tls_handshake(14, b"")
+            random.setstate(state)
             sess.server_send(tls_record(22, flight, 0x0301))
             sess.client_send(tls_record(21, b"\x02\x2a", 0x0301))  # fatal bad_certificate: the client gave up
         sess.close()
-    return sc.write(path)

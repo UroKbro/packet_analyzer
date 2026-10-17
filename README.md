@@ -24,6 +24,7 @@ Every header is parsed by hand with `struct`. There's no scapy and no libpcap. T
 | **Timeline** | One clock for the whole capture: handshakes (with RTT), DNS lookups (with answer time), HTTP exchanges (with response time), TLS sessions, retransmissions, resets and alerts. A swimlane strip shows when each kind of activity happened, and bursts such as a port scan's 20 refusals collapse into one line. |
 | **Risk scoring** | Every conversation gets a 0-100 score with its reasons: alerts on the flow, a scanning source, backdoor ports, an outbound call to one, shell commands in cleartext, high-entropy payload on a non-TLS port, upload-heavy byte ratios, retransmission rate and malformed packets. |
 | **Host profiling** | Every address gets a profile: names (from DHCP, DNS answers, TLS SNI and HTTP Host), MAC, a passive OS guess from the initial TTL and SYN window/options, roles (gateway, DNS/web server, workstation, scanner, external), open and closed ports, services it uses, DNS lookups, TLS names and User-Agents, peers, alerts caused and received, and its riskiest conversation. |
+| **Capture diff** | `diff before.pcap after.pcap` compares two captures by stable keys (client → server:port, DNS name + type, TLS SNI): new and missing conversations (a scan collapses to one line), conversations whose bytes, retransmissions, RTT or risk changed, changed DNS answers and new names, new, increased and resolved alerts, changed TLS servers and certificates, new hosts and newly open ports, protocol mix and per-host bandwidth. `--json` saves the result. |
 | **Incident report** | `report` writes one self-contained HTML file (no scripts, no external assets, light and dark themes) with an executive summary, a timeline chart, every alert explained in plain language with a recommended action, suspicious hosts, top talkers, risk-ranked conversations, DNS, HTTP and TLS activity, and the JSON exports embedded as downloads. `alerts --explain` gives the same explanations in the terminal. |
 | **Export** | `flows.json/csv`, `packets.jsonl`, `alerts.json`, `hosts.json`, `dns.json`, `http.json`, a filtered `packets.pcap`, and the reassembled TCP streams with extracted HTTP bodies |
 
@@ -52,6 +53,8 @@ python3 -m pktanalyzer risk sample.pcap        # conversations ranked by risk sc
 python3 -m pktanalyzer timeline sample.pcap    # handshakes, DNS, HTTP, resets and alerts on one clock
 python3 -m pktanalyzer hosts sample.pcap       # who is on the wire: role, OS guess, ports, lookups, alerts
 python3 -m pktanalyzer hosts sample.pcap 10.0.0.23   # full profile of one host
+python3 -m pktanalyzer sample --baseline before.pcap  # the same network on a quiet day
+python3 -m pktanalyzer diff before.pcap sample.pcap   # what changed between the two captures
 python3 -m pktanalyzer alerts sample.pcap -e   # alerts grouped by rule: why it matters, what to do
 python3 -m pktanalyzer report sample.pcap -o report.html   # shareable HTML incident report
 python3 -m pktanalyzer live -r sample.pcap     # replay it through the live dashboard
@@ -108,6 +111,7 @@ pktanalyzer/
 ├── scoring.py    0-100 risk score per conversation, built from explainable evidence
 ├── timeline.py   time-ordered event view (handshakes, DNS, HTTP, TLS, resets, alerts)
 ├── hosts.py      per-host profiles: names, MAC, OS guess, roles, services, lookups, alerts
+├── diff.py       compares two captures (flows, DNS, TLS, alerts, hosts, ports, bandwidth)
 ├── explain.py    plain-language "why it matters / what to do" for every alert rule
 ├── report.py     self-contained HTML incident report
 ├── export.py     JSON/CSV/pcap/stream export

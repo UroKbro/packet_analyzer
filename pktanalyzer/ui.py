@@ -1,6 +1,7 @@
 """Everything drawn on the terminal, built with ``rich``."""
 from __future__ import annotations
 
+import os
 import time
 from collections import Counter, deque
 from datetime import datetime, timezone
@@ -1004,3 +1005,97 @@ def timeline_view(an: Analyzer, events: list, width: int) -> Group:
     if not events:
         return Group(Text("No events match.", style="grey50"))
     return Group(timeline_swimlanes(events, t0, t1, lane_w), timeline_table(events, t0))
+
+
+# -- capture comparison ------------------------------------------------------
+def _delta(before, after) -> Text:
+    if not isinstance(before, (int, float)) or before == after:
+        return Text("")
+    if before == 0:
+        return Text("new", style="yellow3")
+    pct = (after - before) / abs(before) * 100
+    style = "red3" if pct > 50 else "green3" if pct < -50 else "grey62"
+    return Text(f"{pct:+.0f}%", style=style)
+
+
+def diff_view(d: dict) -> Group:
+    parts = []
+    head = Text()
+    for line in d["headline"]:
+        bad = not line.startswith("No significant")
+        head.append(("▲ " if bad else "✓ ") + line + "\n", style="bold" if bad else "green3")
+    head.rstrip()
+    parts.append(Panel(head, title=f"[bold]{os.path.basename(d['before'])}[/] → [bold]{os.path.basename(d['after'])}[/]",
+                       title_align="left", border_style="red3" if d["new_alerts"] else "cyan"))
+
+    t = Table(box=box.SIMPLE, header_style="bold", title="Overview")
+    t.add_column("Metric")
+    t.add_column("Before", justify="right")
+    t.add_column("After", justify="right")
+    t.add_column("Change", justify="right")
+    for metric, before, after in d["summary"]:
+        fmt = (lambda v: human_bytes(v)) if metric == "Bytes" else (lambda v: f"{v:,}" if isinstance(v, int) else str(v))
+        t.add_row(metric, fmt(before), fmt(after), _delta(before, after))
+    parts.append(t)
+
+    def table(title, cols, rows, style=None):
+        if not rows:
+            return
+        tb = Table(box=box.SIMPLE, header_style="bold", title=title, title_style=style or "bold", expand=True)
+        for c in cols:
+            tb.add_column(c, overflow="fold")
+        for r in rows:
+            tb.add_row(*r)
+        parts.append(tb)
+
+    table(f"New alerts ({len(d['new_alerts'])})", ["Sev", "Rule", "Source → target", "Message"],
+          [(Text(f"{SEV_ICON[a['severity']]} {a['severity']}", style=SEV_STYLE[a["severity"]]), a["rule"],
+            f"{a['src']} → {a['dst']}", a["message"]) for a in d["new_alerts"]], "bold red")
+    table("Alerts that increased", ["Rule", "Source → target", "Before", "After"],
+          [(a["rule"], f"{a['src']} → {a['dst']}", str(a["before"]), str(a["after"])) for a in d["increased_alerts"]])
+    table(f"Resolved alerts ({len(d['resolved_alerts'])})", ["Sev", "Rule", "Source → target"],
+          [(a["severity"], a["rule"], f"{a['src']} → {a['dst']}") for a in d["resolved_alerts"]], "bold green3")
+
+    def risk_cell(r):
+        return Text(str(r) if r else "", style=RISK_STYLE[level_for(r)])
+
+    table(f"New conversations ({len(d['new_conversations'])})", ["Conversation", "Ports", "Flows", "Bytes", "Risk"],
+          [(c["text"], ", ".join(map(str, c["ports"][:12])) + (" …" if len(c["ports"]) > 12 else ""),
+            str(c["flows"]), human_bytes(c["bytes"]), risk_cell(c["max_risk"])) for c in d["new_conversations"]])
+    table(f"Missing conversations ({len(d['missing_conversations'])})", ["Conversation", "Flows", "Bytes"],
+          [(c["text"], str(c["flows"]), human_bytes(c["bytes"])) for c in d["missing_conversations"]], "grey62")
+    table("Changed conversations", ["Conversation", "What changed", "Risk"],
+          [(c["text"], "; ".join(c["changes"]), risk_cell(c["max_risk"])) for c in d["changed_conversations"]])
+
+    table("Changed DNS answers", ["Name", "Type", "Before", "After"],
+          [(x["name"], x["qtype"], ", ".join(x["before"]), Text(", ".join(x["after"]), style="yellow3"))
+           for x in d["dns_changed"]], "bold yellow3")
+    table(f"New DNS names ({len(d['dns_new'])})", ["Name", "Type", "Answer", "Asked by"],
+          [(x["name"], x["qtype"], ", ".join(x["answers"][:3]), ", ".join(x["clients"])) for x in d["dns_new"]])
+    if d["dns_missing"]:
+        parts.append(Text("No longer looked up: " + ", ".join(x["name"] for x in d["dns_missing"][:15]),
+                          style="grey62"))
+
+    table("Changed TLS", ["SNI", "What changed"], [(x["sni"], "; ".join(x["changes"])) for x in d["tls_changed"]],
+          "bold yellow3")
+    table("New TLS servers", ["SNI", "Server", "Version", "Cipher", "Certificate"],
+          [(x["sni"], x["server"], x["version"] or "", x["cipher"] or "",
+            f"{x['subject'] or ''}" + (f" by {x['issuer']}" if x["issuer"] else "")) for x in d["tls_new"]])
+
+    table("Open ports", ["Host", "Newly open", "No longer open"],
+          [(p["host"], Text(", ".join(map(str, p["opened"])), style="red3"), ", ".join(map(str, p["closed"])))
+           for p in d["port_changes"]])
+    table(f"New hosts ({len(d['new_hosts'])})", ["Host", "Name", "Role", "Open ports", "Alerts"],
+          [(h["host"], h["name"], ", ".join(h["roles"]), ", ".join(map(str, h["open_ports"])),
+            str(h["alerts"] or "")) for h in d["new_hosts"]])
+    if d["missing_hosts"]:
+        parts.append(Text("Hosts no longer seen: " + ", ".join(h["host"] + (f" ({h['name']})" if h["name"] else "")
+                                                             for h in d["missing_hosts"][:15]), style="grey62"))
+
+    table("Protocol mix (share of packets)", ["Protocol", "Before", "After", "Change"],
+          [(p["protocol"], f"{p['before']}%", f"{p['after']}%",
+            Text(f"{p['delta']:+.1f} pts" + (f" ({p['status']})" if p["status"] else ""),
+                 style="yellow3" if p["status"] else "")) for p in d["protocols"]])
+    table("Bandwidth per host (bytes sent per second)", ["Host", "Before", "After"],
+          [(b["host"], f"{b['before']:,} B/s", f"{b['after']:,} B/s") for b in d["bandwidth"]])
+    return Group(*parts)

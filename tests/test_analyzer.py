@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, dns, explain, filters, hosts, report, scoring, timeline, tls, x509  # noqa: E402
+from pktanalyzer import craft, diff, dns, explain, filters, hosts, report, scoring, timeline, tls, x509  # noqa: E402
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -481,6 +481,57 @@ class TestHosts(unittest.TestCase):
         self.assertEqual(prof["192.168.1.40"].names["nk-laptop"], "dhcp")
 
 
+class TestDiff(unittest.TestCase):
+    @staticmethod
+    def _analyze(path):
+        an = Analyzer(keep_packets=False)
+        for _ in an.run(open_capture(path)):
+            pass
+        return an
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.before = os.path.join(cls.dir.name, "before.pcap")
+        cls.after = os.path.join(cls.dir.name, "after.pcap")
+        craft.write_sample(cls.before, baseline=True)
+        craft.write_sample(cls.after)
+        cls.d = diff.diff_files(cls.before, cls.after, cls._analyze)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dir.cleanup()
+
+    def test_changes_found(self):
+        d = self.d
+        self.assertEqual([(x["name"], x["before"], x["after"]) for x in d["dns_changed"]],
+                         [("github.com", ["140.82.112.4"], ["140.82.112.3"])])
+        self.assertIn("login.paypa1-secure.com", [x["name"] for x in d["dns_new"]])
+        rules = {x["rule"] for x in d["new_alerts"]}
+        self.assertTrue({"port-scan", "arp-spoof", "tls-expired-cert", "suspicious-port"} <= rules)
+        self.assertFalse(d["resolved_alerts"])
+        scan = d["new_conversations"][0]
+        self.assertEqual((scan["client"], scan["server"], len(scan["ports"])), ("10.0.0.66", "10.0.0.23", 20))
+        self.assertIn("retransmissions 0 → 1", [c for x in d["changed_conversations"] for c in x["changes"]])
+        self.assertEqual(d["port_changes"], [dict(host="10.0.0.23", opened=[22, 8080], closed=[])])
+        self.assertEqual([x["sni"] for x in d["tls_changed"]], ["github.com"])  # same cert for api.example.com
+        self.assertEqual([x["sni"] for x in d["tls_new"]], ["login.paypa1-secure.com"])
+        self.assertIn("10.0.0.66", [h["host"] for h in d["new_hosts"]])
+        self.assertIn("140.82.112.4", [h["host"] for h in d["missing_hosts"]])
+        self.assertTrue(d["headline"][0].startswith("16 new alert(s)"))
+        json.dumps(d, default=str)
+
+    def test_reverse_and_identical(self):
+        back = diff.diff_files(self.after, self.before, self._analyze)
+        self.assertEqual(len(back["resolved_alerts"]), len(self.d["new_alerts"]))
+        self.assertFalse(back["new_alerts"])
+        same = diff.diff_files(self.before, self.before, self._analyze)
+        self.assertEqual(same["headline"], ["No significant differences."])
+        for k in ("new_conversations", "missing_conversations", "changed_conversations", "dns_changed", "tls_changed",
+                  "new_hosts", "port_changes", "protocols", "bandwidth"):
+            self.assertFalse(same[k], k)
+
+
 class TestReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -541,6 +592,8 @@ class TestCLI(unittest.TestCase):
                          ["tls", path, "--certs"], ["flows", path, "--sort", "risk"],
                          ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
                          ["hosts", path], ["hosts", path, "10.0.0.23"], ["hosts", path, "--all", "-n", "3"],
+                         ["sample", "--baseline", os.path.join(d, "b.pcap")],
+                         ["diff", os.path.join(d, "b.pcap"), path, "--json", os.path.join(d, "d.json")],
                          ["report", path, "-o", os.path.join(d, "r.html")],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
