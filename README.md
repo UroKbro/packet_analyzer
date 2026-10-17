@@ -21,6 +21,7 @@ Every header is parsed by hand with `struct`. There's no scapy and no libpcap. T
 | **Filters** | Wireshark-style fields mixed with tcpdump shorthands (see below) |
 | **Anomaly detection** | Port scans, host sweeps, UDP scans, SYN floods, NULL/Xmas/FIN/SYN+FIN scans, LAND, ARP spoofing, DNS tunneling (by name length and entropy), NXDOMAIN bursts, unsolicited DNS answers, scanner User-Agents, path traversal and SQLi/XSS in URIs, cleartext credentials (HTTP Basic, FTP, Telnet, POP3, IMAP), connections accepted on backdoor ports, fragment attacks |
 | **Visualization** | A coloured packet list, a layer tree with a hex dump coloured by protocol layer, a TCP conversation ladder diagram, a protocol hierarchy, top talkers, and a full-screen live dashboard |
+| **Timeline** | One clock for the whole capture: handshakes (with RTT), DNS lookups (with answer time), HTTP exchanges (with response time), TLS sessions, retransmissions, resets and alerts. A swimlane strip shows when each kind of activity happened, and bursts such as a port scan's 20 refusals collapse into one line. |
 | **Export** | `flows.json/csv`, `packets.jsonl`, `alerts.json`, `dns.json`, `http.json`, a filtered `packets.pcap`, and the reassembled TCP streams with extracted HTTP bodies |
 
 ## Install
@@ -43,6 +44,7 @@ python3 -m pktanalyzer flows sample.pcap       # conversations with state and RT
 python3 -m pktanalyzer follow sample.pcap 2    # ladder diagram + reassembled HTTP stream
 python3 -m pktanalyzer show sample.pcap 8      # full dissection + coloured hex dump of packet 8
 python3 -m pktanalyzer alerts sample.pcap      # what looks suspicious
+python3 -m pktanalyzer timeline sample.pcap    # handshakes, DNS, HTTP, resets and alerts on one clock
 python3 -m pktanalyzer live -r sample.pcap     # replay it through the live dashboard
 python3 -m pktanalyzer export sample.pcap -o out/
 ```
@@ -93,6 +95,7 @@ pktanalyzer/
 ├── anomalies.py  sliding-window detectors that raise rate-limited alerts
 ├── filters.py    tokenizer + recursive-descent parser → predicate closures
 ├── analyzer.py   pipeline (decode → track → detect → stats) and the Info column
+├── timeline.py   time-ordered event view (handshakes, DNS, HTTP, TLS, resets, alerts)
 ├── export.py     JSON/CSV/pcap/stream export
 ├── craft.py      packet builder (the decoder in reverse) and the demo scenario
 ├── ui.py         all rich rendering: tables, trees, hex dump, ladder, dashboard

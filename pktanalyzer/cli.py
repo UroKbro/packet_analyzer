@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from . import __version__, ui
+from . import __version__, timeline, ui
 from .analyzer import Analyzer
 from .capture import CaptureError, default_interface, list_interfaces, live_frames
 from .craft import write_sample
@@ -99,6 +99,20 @@ def cmd_follow(args) -> None:
     if flow.proto == "tcp" and not args.no_stream:
         con.print(Rule("Reassembled stream", style="grey42"))
         con.print(ui.stream_view(flow, max_bytes=args.bytes))
+
+
+def cmd_timeline(args) -> None:
+    an = _analyze(args.file, keep=False)
+    kinds = timeline.KINDS if args.all else timeline.DEFAULT_KINDS
+    if args.kinds:
+        kinds = tuple(k.strip() for k in args.kinds.split(","))
+        bad = [k for k in kinds if k not in timeline.KINDS]
+        if bad:
+            con.print(f"[red]Unknown kind(s): {', '.join(bad)}. Choose from {', '.join(timeline.KINDS)}")
+            sys.exit(2)
+    events = timeline.build(an, kinds, host=args.host, flow_id=args.flow, collapse=not args.no_collapse)
+    con.print(timeline.render(an, events, con.width))
+    con.print(Text(f"{len(events)} events · {sum(e.count for e in events)} occurrences", style="grey62"))
 
 
 def cmd_alerts(args) -> None:
@@ -260,6 +274,15 @@ def build_parser() -> argparse.ArgumentParser:
     fo.add_argument("--bytes", type=int, default=4000, help="max stream bytes to print per direction")
     fo.add_argument("--no-stream", action="store_true")
     fo.set_defaults(func=cmd_follow)
+
+    tl = sub.add_parser("timeline", help="time-ordered view of handshakes, DNS, HTTP, TLS, resets and alerts")
+    tl.add_argument("file")
+    tl.add_argument("-k", "--kinds", help="comma-separated: " + ",".join(timeline.KINDS))
+    tl.add_argument("--all", action="store_true", help="include connection closes too")
+    tl.add_argument("--host", help="only events involving this IP")
+    tl.add_argument("--flow", type=int, help="only events of this flow")
+    tl.add_argument("--no-collapse", action="store_true", help="don't merge bursts of refusals/retransmissions")
+    tl.set_defaults(func=cmd_timeline)
 
     al = sub.add_parser("alerts", help="run the anomaly detector and list findings")
     al.add_argument("file")

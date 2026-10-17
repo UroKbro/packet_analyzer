@@ -86,6 +86,7 @@ class Flow:
     http: list = field(default_factory=list)
     dns: list = field(default_factory=list)
     tls_sni: str | None = None
+    tls_ts: float | None = None       # when the ClientHello carrying the SNI was seen
     app: str | None = None
     midstream: bool = False
     history: list = field(default_factory=list)   # state transitions (ts, state)
@@ -387,6 +388,8 @@ class FlowTracker:
             flow.app = "TLS"
             if t.get("sni"):
                 flow.tls_sni = t["sni"]
+                if flow.tls_ts is None:
+                    flow.tls_ts = pkt.ts
         if pkt.layer("dhcp") is not None:
             flow.app = "DHCP"
 

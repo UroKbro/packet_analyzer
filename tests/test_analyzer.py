@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, dns, filters                       # noqa: E402
+from pktanalyzer import craft, dns, filters, timeline                       # noqa: E402
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -306,6 +306,31 @@ class TestDetectionAndExport(unittest.TestCase):
         self.assertIn("syn-flood", {a.rule for a in an.alerts})
 
 
+class TestTimeline(unittest.TestCase):
+    def test_sample_story(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            an = Analyzer()
+            for _ in an.run(open_capture(path)):
+                pass
+        events = timeline.build(an)
+        self.assertEqual(events, sorted(events, key=lambda e: e.ts))
+        kinds = {e.kind for e in events}
+        self.assertTrue({"handshake", "dns", "http", "tls", "retrans", "reset", "alert"} <= kinds)
+        dns_ev = next(e for e in events if e.kind == "dns" and "example.com" in e.title)
+        self.assertAlmostEqual(dns_ev.duration, 0.012, places=4)
+        http_ev = next(e for e in events if e.kind == "http" and "/index.html" in e.title)
+        self.assertIn("200", http_ev.detail)
+        scan = next(e for e in events if e.kind == "reset" and e.count > 1)
+        self.assertEqual(scan.count, 20)
+        self.assertIn("ports 21, 22", scan.detail)
+        # filtering by host and flow
+        self.assertTrue(all("10.0.0.66" in (e.src, e.dst) for e in timeline.build(an, host="10.0.0.66")))
+        self.assertTrue(all(e.flow == 2 for e in timeline.build(an, flow_id=2)))
+        self.assertGreater(len(timeline.build(an, collapse=False)), len(events))
+
+
 class TestCLI(unittest.TestCase):
     def test_commands_run(self):
         from pktanalyzer import cli, ui
@@ -317,7 +342,8 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(cli.main(["sample", path]), 0)
             for args in (["read", path], ["read", path, "-f", "http", "-v", "-x"], ["show", path, "8"],
                          ["stats", path], ["flows", path, "--sort", "bytes"], ["follow", path, "2"],
-                         ["alerts", path], ["export", path, "-o", os.path.join(d, "ex")]):
+                         ["alerts", path], ["timeline", path], ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
+                         ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
             self.assertEqual(cli.main(["read", path, "-f", "tcp and ("]), 2)
             out = buf.getvalue()
