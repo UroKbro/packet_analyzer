@@ -29,6 +29,7 @@ LAYER_STYLE = {
     "icmp": "orange1", "icmpv6": "orange1", "igmp": "grey58", "dns": "magenta", "mdns": "magenta",
     "http": "green3", "tls": "gold1", "dhcp": "plum2",
 }
+RISK_STYLE = {"HIGH": "bold red", "MEDIUM": "dark_orange", "LOW": "yellow3", "NONE": "grey50"}
 SEV_STYLE = {"high": "bold red", "medium": "dark_orange", "low": "yellow3"}
 SEV_ICON = {"high": "●", "medium": "▲", "low": "◆"}
 STATE_STYLE = {"ESTABLISHED": "green3", "CLOSED": "grey58", "FIN_WAIT": "yellow3", "CLOSING": "yellow3",
@@ -269,6 +270,9 @@ def flows_table(flows: list[Flow], limit: int | None = None, title: str = "Conve
     if not compact:
         t.add_column("Dur", justify="right", no_wrap=True)
     t.add_column("RTT", justify="right", no_wrap=True)
+    show_risk = any(getattr(f, "risk", None) for f in flows)
+    if show_risk:
+        t.add_column("Risk", justify="right", no_wrap=True)
     t.add_column("Notes", overflow="fold", ratio=1, min_width=12)
     for f in flows[:limit] if limit else flows:
         notes = []
@@ -306,8 +310,36 @@ def flows_table(flows: list[Flow], limit: int | None = None, title: str = "Conve
         cells.append(human_bytes(f.bytes))
         if not compact:
             cells.append(f"{f.duration:.3f}s")
-        cells += [f"{f.rtt * 1000:.1f}ms" if f.rtt is not None else "", "; ".join(notes)]
+        cells.append(f"{f.rtt * 1000:.1f}ms" if f.rtt is not None else "")
+        if show_risk:
+            cells.append(Text(str(f.risk.score) if f.risk.score else "·", style=RISK_STYLE[f.risk.level]))
+        cells.append("; ".join(notes))
         t.add_row(*cells)
+    return t
+
+
+def risk_table(flows: list[Flow], limit: int | None = None, show_all: bool = False) -> Table:
+    t = Table(title="Conversation risk", box=box.SIMPLE_HEAVY, header_style="bold", expand=True,
+              title_style="bold")
+    t.add_column("Risk", no_wrap=True)
+    t.add_column("Flow", justify="right", style="grey62", no_wrap=True)
+    t.add_column("Conversation", no_wrap=True)
+    t.add_column("App", no_wrap=True)
+    t.add_column("Reasons", ratio=1, overflow="fold")
+    rows = [f for f in flows if show_all or f.risk.score > 0]
+    for f in rows[:limit] if limit else rows:
+        r = f.risk
+        style = RISK_STYLE[r.level]
+        meter = Text()
+        meter.append(f"{r.score:>3}/100 ", style=style)
+        meter.append(f"{r.level:<6} ", style=style)
+        meter.append_text(bar(r.score, 100, 10, style.replace("bold ", "")))
+        client = f"{f.client[0]}:{f.client[1]}" if f.client[1] else f.client[0]
+        server = f"{f.server[0]}:{f.server[1]}" if f.server[1] else f.server[0]
+        t.add_row(meter, str(f.id), f"{client} → {server}", Text(f.label, style=PROTO_STYLE.get(f.label.upper(), "white")),
+                  Text("; ".join(r.reasons) or "nothing notable", style="white" if r.reasons else "grey50"))
+    if not rows:
+        t.add_row("", "", Text("No conversation scored above zero.", style="green3"), "", "")
     return t
 
 
@@ -388,6 +420,10 @@ def handshake_panel(flow: Flow) -> Panel:
         t.add_row("RTT", f"{flow.rtt * 1000:.2f} ms  (server side {(hsd['synack'] - hsd['syn']) * 1000:.2f} ms, "
                          f"client side {(hsd['ack'] - hsd['synack']) * 1000:.2f} ms)")
     t.add_row("State history", " → ".join(s for _, s in flow.history) or "-")
+    if getattr(flow, "risk", None):
+        r = flow.risk
+        t.add_row("Risk", Text.assemble((f"{r.score}/100 {r.level}", RISK_STYLE[r.level]),
+                                        ("  " + "; ".join(r.reasons) if r.reasons else "", "grey70")))
     if flow.proto == "tcp":
         for name, ep in (("Client → Server", flow.c2s), ("Server → Client", flow.s2c)):
             t.add_row(name, f"{ep.packets} pkts, {human_bytes(ep.stream_total)} stream, "

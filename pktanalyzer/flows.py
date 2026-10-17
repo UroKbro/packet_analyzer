@@ -94,6 +94,8 @@ class Flow:
     s2c: Endpoint | None = None
     pending_requests: list = field(default_factory=list)
     syn_retries: int = 0
+    malformed: int = 0               # packets with decode warnings (bad checksum, truncation, ...)
+    risk: object = None              # filled in by scoring.score_flows()
 
     @property
     def key_str(self) -> str:
@@ -130,6 +132,8 @@ class Flow:
                                lost_bytes=ep.lost_bytes, isn=ep.isn)
         if self.tls_sni:
             d["tls_sni"] = self.tls_sni
+        if self.risk is not None:
+            d["risk"] = self.risk.to_dict()
         if self.http:
             d["http"] = [_http_tx_dict(t) for t in self.http]
         if self.dns:
@@ -186,6 +190,8 @@ class FlowTracker:
         flow.packets += 1
         flow.bytes += pkt.orig_len
         flow.last_ts = pkt.ts
+        if any("checksum" not in w for w in pkt.warnings):  # checksum offload makes those unreliable live
+            flow.malformed += 1
         direction = "c2s" if a == flow.client else "s2c"
         pkt.flow_id = flow.id
         pkt.direction = direction

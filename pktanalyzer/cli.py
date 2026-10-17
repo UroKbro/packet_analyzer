@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from . import __version__, timeline, ui
+from . import __version__, scoring, timeline, ui
 from .analyzer import Analyzer
 from .capture import CaptureError, default_interface, list_interfaces, live_frames
 from .craft import write_sample
@@ -71,6 +71,7 @@ def cmd_stats(args) -> None:
 
 def cmd_flows(args) -> None:
     an = _analyze(args.file, keep=False)
+    scoring.score_flows(an)
     flows = an.flows
     if args.filter:
         pred = compile_filter(args.filter)
@@ -78,7 +79,7 @@ def cmd_flows(args) -> None:
         ids = {p.flow_id for p in an2.run(open_capture(args.file)) if pred(p)}
         flows = [f for f in flows if f.id in ids]
     key = {"bytes": lambda f: -f.bytes, "packets": lambda f: -f.packets, "time": lambda f: f.first_ts,
-           "duration": lambda f: -f.duration}[args.sort]
+           "duration": lambda f: -f.duration, "risk": lambda f: (-f.risk.score, f.first_ts)}[args.sort]
     con.print(ui.flows_table(sorted(flows, key=key), limit=args.limit))
 
 
@@ -88,6 +89,7 @@ def cmd_follow(args) -> None:
     if flow is None:
         con.print(f"[red]No flow {args.flow}. Run `flows` to list them.")
         sys.exit(1)
+    scoring.score_flows(an)
     if flow.proto == "tcp":
         con.print(ui.handshake_panel(flow))
     con.print(Rule(f"Conversation ladder · flow {flow.id}", style="grey42"))
@@ -113,6 +115,14 @@ def cmd_timeline(args) -> None:
     events = timeline.build(an, kinds, host=args.host, flow_id=args.flow, collapse=not args.no_collapse)
     con.print(timeline.render(an, events, con.width))
     con.print(Text(f"{len(events)} events · {sum(e.count for e in events)} occurrences", style="grey62"))
+
+
+def cmd_risk(args) -> None:
+    an = _analyze(args.file, keep=False)
+    flows = scoring.score_flows(an)
+    if args.min:
+        flows = [f for f in flows if f.risk.score >= args.min]
+    con.print(ui.risk_table(flows, limit=args.limit, show_all=args.all))
 
 
 def cmd_alerts(args) -> None:
@@ -263,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     fl = sub.add_parser("flows", help="list conversations with TCP state and handshake RTT")
     fl.add_argument("file")
     fl.add_argument("-f", "--filter", help="only flows containing a matching packet")
-    fl.add_argument("--sort", choices=["bytes", "packets", "time", "duration"], default="time")
+    fl.add_argument("--sort", choices=["bytes", "packets", "time", "duration", "risk"], default="time")
     fl.add_argument("-n", "--limit", type=int)
     fl.set_defaults(func=cmd_flows)
 
@@ -283,6 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
     tl.add_argument("--flow", type=int, help="only events of this flow")
     tl.add_argument("--no-collapse", action="store_true", help="don't merge bursts of refusals/retransmissions")
     tl.set_defaults(func=cmd_timeline)
+
+    rk = sub.add_parser("risk", help="rank conversations by a 0-100 risk score, with reasons")
+    rk.add_argument("file")
+    rk.add_argument("-n", "--limit", type=int, default=25)
+    rk.add_argument("--min", type=int, help="only flows scoring at least this")
+    rk.add_argument("--all", action="store_true", help="include flows that scored 0")
+    rk.set_defaults(func=cmd_risk)
 
     al = sub.add_parser("alerts", help="run the anomaly detector and list findings")
     al.add_argument("file")

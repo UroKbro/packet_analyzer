@@ -10,6 +10,7 @@ from .analyzer import Analyzer, info
 from .flows import Flow
 from .packet import Packet
 from .pcap import PcapWriter
+from .scoring import score_flows
 
 
 def _safe(v):
@@ -32,6 +33,7 @@ def packet_dict(pkt: Packet) -> dict:
 def export_all(an: Analyzer, out_dir: str, packets: list[Packet] | None = None, write_streams: bool = True) -> dict:
     """Write a session bundle to ``out_dir`` and return the paths written."""
     os.makedirs(out_dir, exist_ok=True)
+    score_flows(an)
     packets = list(an.packets) if packets is None else packets
     written = {}
 
@@ -44,14 +46,16 @@ def export_all(an: Analyzer, out_dir: str, packets: list[Packet] | None = None, 
     with open(p, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["id", "proto", "app", "client", "server", "state", "packets", "bytes", "first_ts",
-                    "duration", "rtt_ms", "c2s_bytes", "s2c_bytes", "retransmissions", "sni"])
+                    "duration", "rtt_ms", "c2s_bytes", "s2c_bytes", "retransmissions", "sni", "risk", "risk_level",
+                    "risk_reasons"])
         for fl in an.flows:
             c2s = fl.c2s.stream_total if fl.c2s else ""
             s2c = fl.s2c.stream_total if fl.s2c else ""
             rt = fl.c2s.retransmissions + fl.s2c.retransmissions if fl.c2s else ""
             w.writerow([fl.id, fl.proto, fl.label, f"{fl.client[0]}:{fl.client[1]}", f"{fl.server[0]}:{fl.server[1]}",
                         fl.state, fl.packets, fl.bytes, f"{fl.first_ts:.6f}", f"{fl.duration:.6f}",
-                        f"{fl.rtt * 1000:.3f}" if fl.rtt is not None else "", c2s, s2c, rt, fl.tls_sni or ""])
+                        f"{fl.rtt * 1000:.3f}" if fl.rtt is not None else "", c2s, s2c, rt, fl.tls_sni or "",
+                        fl.risk.score, fl.risk.level, "; ".join(fl.risk.reasons)])
     written["flows.csv"] = p
 
     p = os.path.join(out_dir, "packets.jsonl")

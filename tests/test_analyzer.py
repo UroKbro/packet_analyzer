@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, dns, filters, timeline                       # noqa: E402
+from pktanalyzer import craft, dns, filters, scoring, timeline                       # noqa: E402
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -331,6 +331,45 @@ class TestTimeline(unittest.TestCase):
         self.assertGreater(len(timeline.build(an, collapse=False)), len(events))
 
 
+class TestScoring(unittest.TestCase):
+    def test_sample_ranking(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            an = Analyzer()
+            for _ in an.run(open_capture(path)):
+                pass
+        ranked = scoring.score_flows(an)
+        top = {f.server[1] for f in ranked[:2]}
+        self.assertEqual(top, {4444, 8080})  # reverse shell and the sqlmap request
+        shell = next(f for f in ranked if f.server[1] == 4444 and "ack" in f.handshake)
+        self.assertEqual(shell.risk.level, "HIGH")
+        self.assertTrue(any("backdoor port 4444" in r for r in shell.risk.reasons))
+        self.assertTrue(any("whoami" in r for r in shell.risk.reasons))
+        normal = next(f for f in ranked if f.server == ("140.82.112.3", 443))
+        self.assertEqual(normal.risk.score, 0)
+        self.assertEqual(normal.risk.level, "NONE")
+
+    def test_entropy_and_upload(self):
+        self.assertLess(scoring.byte_entropy(b"a" * 100), 0.01)
+        self.assertGreater(scoring.byte_entropy(bytes(range(256)) * 4), 7.99)
+        isn_c, isn_s = 100, 900
+        frames = [eth_tcp(A, B, 5000, 7000, isn_c, 0, SYN), eth_tcp(B, A, 7000, 5000, isn_s, isn_c + 1, SYN | ACK),
+                  eth_tcp(A, B, 5000, 7000, isn_c + 1, isn_s + 1, ACK)]
+        random_data = os.urandom(1400)
+        seq = isn_c + 1
+        for _ in range(60):  # ~84 KB of random bytes uploaded to an unregistered port
+            frames.append(eth_tcp(A, B, 5000, 7000, seq, isn_s + 1, ACK, random_data))
+            seq += len(random_data)
+        an = Analyzer()
+        for i, fr in enumerate(frames):
+            an.feed(Frame(1.0 + i * 0.001, fr, LINKTYPE_ETHERNET, len(fr)))
+        f = scoring.score_flows(an)[0]
+        text = " ".join(f.risk.reasons)
+        self.assertIn("high-entropy payload", text)
+        self.assertIn("upload-heavy", text)
+
+
 class TestCLI(unittest.TestCase):
     def test_commands_run(self):
         from pktanalyzer import cli, ui
@@ -342,7 +381,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(cli.main(["sample", path]), 0)
             for args in (["read", path], ["read", path, "-f", "http", "-v", "-x"], ["show", path, "8"],
                          ["stats", path], ["flows", path, "--sort", "bytes"], ["follow", path, "2"],
-                         ["alerts", path], ["timeline", path], ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
+                         ["alerts", path], ["timeline", path], ["risk", path], ["flows", path, "--sort", "risk"], ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
             self.assertEqual(cli.main(["read", path, "-f", "tcp and ("]), 2)
