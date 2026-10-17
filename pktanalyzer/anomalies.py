@@ -10,6 +10,8 @@ import math
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 
+from . import tls as tlsmod
+from . import x509
 from .flows import Flow
 from .packet import Packet
 
@@ -115,6 +117,54 @@ class AnomalyDetector:
         if a is not None:
             self._arp(pkt, a)
         return self.alerts[before:]
+
+    # -- flow-level events (raised by the tracker after stream reassembly) ----
+    def flow_event(self, pkt: Packet | None, flow: Flow, kind: str, data) -> None:
+        if pkt is None or kind != "tls":
+            return
+        ends = dict(src=flow.server[0], dst=flow.client[0])  # the server is the one presenting the problem
+        where = f"{flow.server[0]}:{flow.server[1]}"
+        name = flow.tls_sni or where
+        if data["type"] == "ServerHello":
+            version, cipher = data.get("hello_version"), data.get("cipher", "")
+            if version in tlsmod.OLD_VERSIONS:
+                self._fire(pkt, "medium", "tls-old-version", f"{name} negotiated {version} (deprecated)",
+                           key=f"ver|{where}", **ends)
+            if cipher and tlsmod.is_weak_cipher(cipher):
+                self._fire(pkt, "high", "tls-weak-cipher", f"{name} chose weak cipher {cipher}",
+                           key=f"cipher|{where}", **ends)
+        elif data["type"] == "Certificate" and data.get("certs"):
+            leaf = data["certs"][0]
+            if "error" in leaf:
+                self._fire(pkt, "low", "tls-bad-cert", f"Unparsable certificate from {where}: {leaf['error']}",
+                           key=f"cert|{where}", **ends)
+                return
+            cn = leaf["subject_cn"] or leaf["subject"]
+            if pkt.ts > leaf["not_after"]:
+                days = int((pkt.ts - leaf["not_after"]) // 86400)
+                self._fire(pkt, "high", "tls-expired-cert", f"Certificate for {cn} expired {days} days before this "
+                           f"connection ({where})", key=f"exp|{where}", **ends)
+            elif pkt.ts < leaf["not_before"]:
+                self._fire(pkt, "medium", "tls-cert-not-yet-valid", f"Certificate for {cn} is not valid yet ({where})",
+                           key=f"nyv|{where}", **ends)
+            if leaf["self_signed"] and len(data["certs"]) == 1:
+                self._fire(pkt, "medium", "tls-self-signed", f"Self-signed certificate {cn} presented by {where}",
+                           key=f"self|{where}", **ends)
+            if flow.tls_sni and not x509.name_matches(flow.tls_sni, leaf):
+                names = ", ".join(leaf["sans"][:3]) or cn
+                self._fire(pkt, "high", "tls-name-mismatch",
+                           f"Certificate for {names} does not cover requested name {flow.tls_sni}",
+                           key=f"name|{where}", **ends)
+            if leaf["key_alg"] == "RSA" and leaf["key_bits"] and leaf["key_bits"] < 2048:
+                self._fire(pkt, "medium", "tls-weak-key", f"{cn} uses a {leaf['key_bits']}-bit RSA key",
+                           key=f"key|{where}", **ends)
+            if leaf["sig_alg"].startswith(("md5", "sha1", "ecdsa-with-SHA1")):
+                self._fire(pkt, "low", "tls-weak-signature", f"{cn} is signed with {leaf['sig_alg']}",
+                           key=f"sig|{where}", **ends)
+        elif data["type"] == "Alert" and data["level"] == "fatal":
+            cert_problem = "certificate" in data["description"] or data["description"] in ("unknown_ca",)
+            self._fire(pkt, "medium" if cert_problem else "low", "tls-handshake-failed",
+                       f"TLS fatal alert {data['description']} on {name}", key=f"alert|{where}", **ends)
 
     # -- TCP ------------------------------------------------------------------
     def _tcp(self, pkt: Packet, tcp, flow: Flow | None) -> None:

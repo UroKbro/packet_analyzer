@@ -9,7 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, dns, filters, scoring, timeline                       # noqa: E402
+from pktanalyzer import craft, dns, filters, scoring, timeline, tls, x509                       # noqa: E402
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -254,10 +254,10 @@ class TestFilters(unittest.TestCase):
         self.assertEqual(self.count(""), total)
         self.assertEqual(self.count("tcp") + self.count("not tcp"), total)
         self.assertEqual(self.count("arp"), 3)
-        self.assertEqual(self.count("dns"), 7)
+        self.assertEqual(self.count("dns"), 11)
 
     def test_fields_and_shorthands(self):
-        self.assertEqual(self.count("dns.qname contains example"), 2)
+        self.assertEqual(self.count("dns.qname contains example"), 4)
         self.assertEqual(self.count('http.method == "GET"'), 3)
         self.assertEqual(self.count("tcp.flags.syn and not tcp.flags.ack and dst port 22"), 1)
         self.assertEqual(self.count("tcp.port == 80 && ip.src == 93.184.216.34"),
@@ -267,7 +267,7 @@ class TestFilters(unittest.TestCase):
         self.assertEqual(self.count("http.user_agent matches '^sqlmap'"), 1)
         self.assertEqual(self.count("frame.len > 1400"), self.count("frame.len >= 1401"))
         self.assertEqual(self.count("alerts"), len({a.packet for a in self.an.alerts}))
-        self.assertEqual(self.count("(udp or icmp) and not dns"), self.count("udp or icmp") - 7)
+        self.assertEqual(self.count("(udp or icmp) and not dns"), self.count("udp or icmp") - 11)
 
     def test_errors(self):
         for bad in ("tcp and", "(tcp", "foo", "port abc", "ip.src ==", "http.uri matches '('"):
@@ -304,6 +304,57 @@ class TestDetectionAndExport(unittest.TestCase):
             f = eth_tcp(f"198.51.100.{i % 250}", B, 1024 + i, 80, i, 0, SYN)
             an.feed(Frame(1.0 + i * 0.001, f, LINKTYPE_ETHERNET, len(f)))
         self.assertIn("syn-flood", {a.rule for a in an.alerts})
+
+
+class TestTLS(unittest.TestCase):
+    def test_real_openssl_certificate(self):
+        with open(os.path.join(os.path.dirname(__file__), "data", "selfsigned_rsa2048.der"), "rb") as f:
+            c = x509.parse_certificate(f.read())
+        self.assertEqual(c["subject_cn"], "example.test")
+        self.assertEqual(c["subject_o"], "Test Org")
+        self.assertTrue(c["self_signed"])
+        self.assertEqual(c["key_alg"], "RSA")
+        self.assertEqual(c["key_bits"], 2048)
+        self.assertEqual(c["sig_alg"], "sha256WithRSAEncryption")
+        self.assertEqual(c["sans"], ["example.test", "*.example.test", "10.1.2.3"])
+        # matches `openssl x509 -fingerprint -sha256`
+        self.assertTrue(c["sha256"].startswith("80:9F:8A:AF:37:28:4D:F6"))
+        self.assertTrue(x509.name_matches("www.example.test", c))
+        self.assertFalse(x509.name_matches("a.b.example.test", c))
+        self.assertFalse(x509.name_matches("example.org", c))
+
+    def test_crafted_chain_split_across_records(self):
+        leaf = craft.make_certificate({"CN": "x.test"}, {"CN": "CA"}, 0, 2e9, ["x.test"], key_bits=1024)
+        flight = craft.tls_server_hello(0xC030) + craft.tls_certificate_msg([leaf, leaf]) + craft.tls_handshake(14, b"")
+        records = craft.tls_record(22, flight[:300]) + craft.tls_record(22, flight[300:])
+        p = tls.TlsStreamParser()
+        msgs = []
+        for i in range(0, len(records), 97):  # deliver in awkward slices like TCP segments
+            msgs += p.feed(records[i:i + 97])
+        self.assertEqual([m["type"] for m in msgs], ["ServerHello", "Certificate", "ServerHelloDone"])
+        self.assertEqual(msgs[0]["cipher"], "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384")
+        self.assertEqual(len(msgs[1]["certs"]), 2)
+        self.assertEqual(msgs[1]["certs"][0]["key_bits"], 1024)
+        self.assertTrue(tls.is_weak_cipher("TLS_RSA_WITH_RC4_128_SHA"))
+        self.assertFalse(tls.is_weak_cipher("TLS_AES_128_GCM_SHA256"))
+
+    def test_sample_sessions(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            an = Analyzer()
+            for _ in an.run(open_capture(path)):
+                pass
+        by_sni = {f.tls_sni: f for f in an.flows if f.tls_sni}
+        self.assertEqual(by_sni["github.com"].tls["version"], "TLS 1.3")
+        good = by_sni["api.example.com"].tls
+        self.assertEqual(good["cipher"], "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256")
+        self.assertEqual(len(good["certs"]), 2)
+        self.assertTrue(good["certs"][1]["is_ca"])
+        bad_rules = {a.rule for a in an.alerts if a.src == "203.0.113.50"}
+        self.assertEqual(bad_rules, {"tls-old-version", "tls-weak-cipher", "tls-expired-cert", "tls-self-signed",
+                                     "tls-name-mismatch", "tls-handshake-failed"})
+        self.assertFalse(any(a.src == "198.51.100.20" for a in an.alerts))
 
 
 class TestTimeline(unittest.TestCase):
@@ -381,7 +432,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(cli.main(["sample", path]), 0)
             for args in (["read", path], ["read", path, "-f", "http", "-v", "-x"], ["show", path, "8"],
                          ["stats", path], ["flows", path, "--sort", "bytes"], ["follow", path, "2"],
-                         ["alerts", path], ["timeline", path], ["risk", path], ["flows", path, "--sort", "risk"], ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
+                         ["alerts", path], ["timeline", path], ["risk", path], ["tls", path, "--certs"], ["flows", path, "--sort", "risk"], ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
             self.assertEqual(cli.main(["read", path, "-f", "tcp and ("]), 2)

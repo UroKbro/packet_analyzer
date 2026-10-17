@@ -117,6 +117,89 @@ def tls_client_hello(sni: str) -> bytes:
     return struct.pack("!BHH", 22, 0x0301, len(hs)) + hs
 
 
+# -- DER / X.509 / TLS server flight ----------------------------------------------
+def der(tag: int, content: bytes) -> bytes:
+    n = len(content)
+    if n < 0x80:
+        return bytes([tag, n]) + content
+    lb = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([tag, 0x80 | len(lb)]) + lb + content
+
+
+def der_seq(*parts: bytes) -> bytes:
+    return der(0x30, b"".join(parts))
+
+
+def der_int(n: int) -> bytes:
+    raw = n.to_bytes(max(1, (n.bit_length() + 8) // 8), "big")  # leading 0 keeps it positive
+    return der(0x02, raw)
+
+
+def der_oid(dotted: str) -> bytes:
+    nums = [int(x) for x in dotted.split(".")]
+    out = bytes([nums[0] * 40 + nums[1]])
+    for n in nums[2:]:
+        chunk = [n & 0x7F]
+        n >>= 7
+        while n:
+            chunk.append(0x80 | (n & 0x7F))
+            n >>= 7
+        out += bytes(reversed(chunk))
+    return der(0x06, out)
+
+
+def der_time(ts: float) -> bytes:
+    import time as _t
+    return der(0x17, _t.strftime("%y%m%d%H%M%SZ", _t.gmtime(ts)).encode())
+
+
+def der_name(**rdns: str) -> bytes:
+    oids = {"C": "2.5.4.6", "O": "2.5.4.10", "OU": "2.5.4.11", "CN": "2.5.4.3"}
+    return der_seq(*(der(0x31, der_seq(der_oid(oids[k]), der(0x0C, v.encode()))) for k, v in rdns.items()))
+
+
+def make_certificate(subject: dict, issuer: dict, not_before: float, not_after: float, sans: list[str],
+                     key_bits: int = 2048, ca: bool = False, serial: int = 0x1234,
+                     sig_oid: str = "1.2.840.113549.1.1.11") -> bytes:
+    """A structurally valid X.509 v3 certificate. The signature is filler, not a real one."""
+    modulus = int.from_bytes(bytes([0xC0]) + random.randbytes(key_bits // 8 - 1), "big")
+    spki = der_seq(der_seq(der_oid("1.2.840.113549.1.1.1"), b"\x05\x00"),
+                   der(0x03, b"\x00" + der_seq(der_int(modulus), der_int(65537))))
+    san = der_seq(*(der(0x82, n.encode()) for n in sans))
+    exts = [der_seq(der_oid("2.5.29.17"), der(0x04, san))]
+    if ca:
+        exts.append(der_seq(der_oid("2.5.29.19"), der(0x01, b"\xff"), der(0x04, der_seq(der(0x01, b"\xff")))))
+    alg = der_seq(der_oid(sig_oid), b"\x05\x00")
+    tbs = der_seq(der(0xA0, der_int(2)), der_int(serial), alg, der_name(**issuer),
+                  der_seq(der_time(not_before), der_time(not_after)), der_name(**subject), spki,
+                  der(0xA3, der_seq(*exts)))
+    return der_seq(tbs, alg, der(0x03, b"\x00" + random.randbytes(256)))
+
+
+def tls_record(ctype: int, data: bytes, version: int = 0x0303) -> bytes:
+    out = b""
+    for i in range(0, len(data), 16384):
+        chunk = data[i:i + 16384]
+        out += struct.pack("!BHH", ctype, version, len(chunk)) + chunk
+    return out
+
+
+def tls_handshake(htype: int, body: bytes) -> bytes:
+    return bytes([htype]) + len(body).to_bytes(3, "big") + body
+
+
+def tls_server_hello(cipher: int, version: int = 0x0303, tls13: bool = False) -> bytes:
+    exts = struct.pack("!HHH", 43, 2, 0x0304) if tls13 else b""
+    body = struct.pack("!H", 0x0303 if tls13 else version) + random.randbytes(32) + b"\x20" + random.randbytes(32) + \
+        struct.pack("!HB", cipher, 0) + struct.pack("!H", len(exts)) + exts
+    return tls_handshake(2, body)
+
+
+def tls_certificate_msg(certs: list[bytes]) -> bytes:
+    chain = b"".join(len(c).to_bytes(3, "big") + c for c in certs)
+    return tls_handshake(11, len(chain).to_bytes(3, "big") + chain)
+
+
 class Scenario:
     """Accumulates timestamped frames and writes them out as a pcap."""
 
@@ -231,8 +314,9 @@ def write_sample(path: str, seed: int = 7) -> int:
     t = TcpSession(sc, me_mac, gw_mac, me, "140.82.112.3", 51560, 443, rtt=0.031)
     t.handshake()
     t.client_send(tls_client_hello("github.com"))
-    t.server_send(struct.pack("!BHH", 22, 0x0303, 4) + b"\x02\x00\x00\x00" + struct.pack("!BHH", 23, 0x0303, 64)
-                  + bytes(64))
+    # TLS 1.3: only the ServerHello is readable; the certificate travels encrypted
+    t.server_send(tls_record(22, tls_server_hello(0x1301, tls13=True)) + tls_record(20, b"\x01")
+                  + tls_record(23, random.randbytes(64)))
     t.close()
 
     # 4. Ping, and a fragmented ping (2 fragments)
@@ -301,4 +385,33 @@ def write_sample(path: str, seed: int = 7) -> int:
     # 12. Refused connection (RST to SYN) and a reset mid-connection
     sc.add(eth(me_mac, gw_mac, ipv4(me, "10.0.0.50", 6, tcp(me, "10.0.0.50", 51600, 9000, 777, 0, SYN))), 0.1)
     sc.add(eth(gw_mac, me_mac, ipv4("10.0.0.50", me, 6, tcp("10.0.0.50", me, 9000, 51600, 0, 778, RST | ACK))), 0.001)
+    # 13. Two TLS 1.2 sessions whose certificates travel in the clear
+    day = 86400.0
+    now = sc.t
+    for ident, name, ip, port in ((0x5e6f, "api.example.com", "198.51.100.20", 51720),
+                                  (0x6f70, "login.paypa1-secure.com", "203.0.113.50", 51730)):
+        sc.add(eth(me_mac, gw_mac, ipv4(me, gw, 17, udp(me, gw, port + 1, 53, dns_query(ident, name)))), 0.2)
+        sc.add(eth(gw_mac, me_mac, ipv4(gw, me, 17, udp(gw, me, 53, port + 1, dns_response(
+            ident, name, [(1, socket.inet_aton(ip))])))), 0.015)
+        sess = TcpSession(sc, me_mac, gw_mac, me, ip, port, 443, rtt=0.04)
+        sess.handshake()
+        sess.client_send(tls_client_hello(name))
+        if name == "api.example.com":
+            ca = {"C": "US", "O": "Example Trust Services", "CN": "Example Issuing CA R3"}
+            leaf = make_certificate({"CN": "api.example.com"}, ca, now - 30 * day, now + 60 * day,
+                                    ["api.example.com", "*.api.example.com"], serial=0x0A1B2C3D)
+            inter = make_certificate(ca, {"C": "US", "O": "Example Trust Services", "CN": "Example Root CA"},
+                                     now - 900 * day, now + 900 * day, [], ca=True, serial=0x77)
+            flight = tls_server_hello(0xC02F) + tls_certificate_msg([leaf, inter]) + tls_handshake(14, b"")
+            sess.server_send(tls_record(22, flight))
+            sess.client_send(tls_record(22, tls_handshake(16, random.randbytes(66))) + tls_record(20, b"\x01")
+                             + tls_record(23, random.randbytes(40)))
+        else:
+            # phishing site: old protocol, RC4, an expired self-signed cert for the wrong name
+            leaf = make_certificate({"O": "Dev", "CN": "localhost"}, {"O": "Dev", "CN": "localhost"},
+                                    now - 400 * day, now - 35 * day, ["localhost"], serial=1)
+            flight = tls_server_hello(0x0005, version=0x0301) + tls_certificate_msg([leaf]) + tls_handshake(14, b"")
+            sess.server_send(tls_record(22, flight, 0x0301))
+            sess.client_send(tls_record(21, b"\x02\x2a", 0x0301))  # fatal bad_certificate: the client gave up
+        sess.close()
     return sc.write(path)

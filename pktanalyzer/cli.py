@@ -94,6 +94,8 @@ def cmd_follow(args) -> None:
         con.print(ui.handshake_panel(flow))
     con.print(Rule(f"Conversation ladder · flow {flow.id}", style="grey42"))
     con.print(ui.ladder(flow, limit=args.limit))
+    if flow.tls:
+        con.print(ui.cert_panel(flow))
     if flow.http:
         con.print(ui.http_table([flow]))
     if flow.dns:
@@ -123,6 +125,19 @@ def cmd_risk(args) -> None:
     if args.min:
         flows = [f for f in flows if f.risk.score >= args.min]
     con.print(ui.risk_table(flows, limit=args.limit, show_all=args.all))
+
+
+def cmd_tls(args) -> None:
+    an = _analyze(args.file, keep=False)
+    flows = [f for f in an.flows if f.tls or f.tls_sni]
+    if not flows:
+        con.print("[grey62]No TLS sessions found.")
+        return
+    con.print(ui.tls_table(flows))
+    if args.certs:
+        for f in flows:
+            if f.tls.get("certs"):
+                con.print(ui.cert_panel(f))
 
 
 def cmd_alerts(args) -> None:
@@ -300,6 +315,11 @@ def build_parser() -> argparse.ArgumentParser:
     rk.add_argument("--min", type=int, help="only flows scoring at least this")
     rk.add_argument("--all", action="store_true", help="include flows that scored 0")
     rk.set_defaults(func=cmd_risk)
+
+    ts_ = sub.add_parser("tls", help="TLS sessions: SNI, version, cipher suite and certificate details")
+    ts_.add_argument("file")
+    ts_.add_argument("--certs", action="store_true", help="print every certificate chain in full")
+    ts_.set_defaults(func=cmd_tls)
 
     al = sub.add_parser("alerts", help="run the anomaly detector and list findings")
     al.add_argument("file")

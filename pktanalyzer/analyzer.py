@@ -18,6 +18,9 @@ class Analyzer:
         self.decoder = Decoder(verify_checksums=verify_checksums)
         self.tracker = FlowTracker()
         self.detector = detector or AnomalyDetector()
+        # stream-level findings (TLS certificates, ...) reach the detector through the tracker
+        self.tracker.listeners.append(
+            lambda flow, kind, data: self.detector.flow_event(self.tracker.current, flow, kind, data))
         self.keep_packets = keep_packets
         # keep every packet for offline analysis, or a ring buffer for live views
         self.packets: list[Packet] | deque = deque(maxlen=history) if history else []

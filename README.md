@@ -14,12 +14,12 @@ Every header is parsed by hand with `struct`. There's no scapy and no libpcap. T
 | **Link / network** | Ethernet II, 802.1Q/QinQ VLANs, Linux cooked capture, BSD loopback, ARP, IPv4 (options, checksum validation), IPv6 (extension-header chain walking) |
 | **Fragmentation** | Reassembles fragmented IPv4 and IPv6 datagrams, and detects overlapping fragments (teardrop) and oversize fragments (ping of death) |
 | **Transport** | TCP (flags, options: MSS / window scale / SACK / timestamps, pseudo-header checksum), UDP, ICMP / ICMPv6. For ICMP errors it decodes the quoted packet, so you can see which connection failed. |
-| **Application** | DNS (all common record types and name compression, with pointer-loop protection), HTTP/1.x (requests, responses, Content-Length and chunked bodies), TLS (record types, ClientHello SNI, ALPN, version), DHCP |
+| **Application** | DNS (all common record types and name compression, with pointer-loop protection), HTTP/1.x (requests, responses, Content-Length and chunked bodies), TLS (SNI, ALPN, negotiated version and cipher suite, and for TLS 1.2 and older the full certificate chain via a hand-written DER/X.509 parser: subject, issuer, validity, SANs, key type and size, signature algorithm, SHA-1/SHA-256 fingerprints), DHCP |
 | **TCP state machine** | A passive RFC 793 tracker: `SYN_SENT → SYN_RECEIVED → ESTABLISHED → FIN_WAIT → CLOSING → CLOSED`, plus `RESET` and `REFUSED`. It also handles captures that start mid-stream and port reuse. |
 | **Handshake reconstruction** | Times SYN / SYN-ACK / ACK and splits the RTT into server-side and client-side halves |
 | **Stream reassembly** | Reorders segments by sequence number (32-bit wraparound safe), trims overlaps, and counts retransmissions and out-of-order segments. The rebuilt stream feeds the HTTP parser. |
 | **Filters** | Wireshark-style fields mixed with tcpdump shorthands (see below) |
-| **Anomaly detection** | Port scans, host sweeps, UDP scans, SYN floods, NULL/Xmas/FIN/SYN+FIN scans, LAND, ARP spoofing, DNS tunneling (by name length and entropy), NXDOMAIN bursts, unsolicited DNS answers, scanner User-Agents, path traversal and SQLi/XSS in URIs, cleartext credentials (HTTP Basic, FTP, Telnet, POP3, IMAP), connections accepted on backdoor ports, fragment attacks |
+| **Anomaly detection** | Port scans, host sweeps, UDP scans, SYN floods, NULL/Xmas/FIN/SYN+FIN scans, LAND, ARP spoofing, DNS tunneling (by name length and entropy), NXDOMAIN bursts, unsolicited DNS answers, scanner User-Agents, path traversal and SQLi/XSS in URIs, cleartext credentials (HTTP Basic, FTP, Telnet, POP3, IMAP), connections accepted on backdoor ports, fragment attacks, and TLS problems: expired, not-yet-valid or self-signed certificates, certificates that don't cover the requested name, weak ciphers (RC4, 3DES, NULL, EXPORT), deprecated protocol versions, weak keys and signatures, fatal handshake alerts |
 | **Visualization** | A coloured packet list, a layer tree with a hex dump coloured by protocol layer, a TCP conversation ladder diagram, a protocol hierarchy, top talkers, and a full-screen live dashboard |
 | **Timeline** | One clock for the whole capture: handshakes (with RTT), DNS lookups (with answer time), HTTP exchanges (with response time), TLS sessions, retransmissions, resets and alerts. A swimlane strip shows when each kind of activity happened, and bursts such as a port scan's 20 refusals collapse into one line. |
 | **Risk scoring** | Every conversation gets a 0-100 score with its reasons: alerts on the flow, a scanning source, backdoor ports, an outbound call to one, shell commands in cleartext, high-entropy payload on a non-TLS port, upload-heavy byte ratios, retransmission rate and malformed packets. |
@@ -45,6 +45,7 @@ python3 -m pktanalyzer flows sample.pcap       # conversations with state and RT
 python3 -m pktanalyzer follow sample.pcap 2    # ladder diagram + reassembled HTTP stream
 python3 -m pktanalyzer show sample.pcap 8      # full dissection + coloured hex dump of packet 8
 python3 -m pktanalyzer alerts sample.pcap      # what looks suspicious
+python3 -m pktanalyzer tls sample.pcap --certs # TLS versions, ciphers and certificate chains
 python3 -m pktanalyzer risk sample.pcap        # conversations ranked by risk score, with reasons
 python3 -m pktanalyzer timeline sample.pcap    # handshakes, DNS, HTTP, resets and alerts on one clock
 python3 -m pktanalyzer live -r sample.pcap     # replay it through the live dashboard
@@ -92,7 +93,8 @@ pktanalyzer/
 ├── decoder.py    link → network → transport decoders, checksums, IP defragmentation
 ├── dns.py        DNS message parser with compression pointers
 ├── http.py       per-packet HTTP header parser + incremental stream parser
-├── tls.py        TLS record / ClientHello parser (SNI, ALPN)
+├── tls.py        TLS records, hellos, cipher suites, stream parser for certificate messages
+├── x509.py       DER/ASN.1 reader for X.509 certificates
 ├── flows.py      flow table, passive TCP state machine, handshake timing, reassembly
 ├── anomalies.py  sliding-window detectors that raise rate-limited alerts
 ├── filters.py    tokenizer + recursive-descent parser → predicate closures

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, deque
-from datetime import datetime
+from datetime import datetime, timezone
 
 from rich import box
 from rich.console import Console, Group
@@ -316,6 +316,111 @@ def flows_table(flows: list[Flow], limit: int | None = None, title: str = "Conve
         cells.append("; ".join(notes))
         t.add_row(*cells)
     return t
+
+
+def _date(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d") if ts else "?"
+
+
+def tls_findings(flow: Flow) -> list[tuple[str, str]]:
+    """(label, style) badges for what's wrong (or right) with a TLS session."""
+    from . import tls as tlsmod, x509
+    t = flow.tls
+    out = []
+    if t.get("version") in tlsmod.OLD_VERSIONS:
+        out.append((f"old {t['version']}", "dark_orange"))
+    if t.get("cipher") and tlsmod.is_weak_cipher(t["cipher"]):
+        out.append(("weak cipher", "bold red"))
+    certs = t.get("certs") or []
+    if certs and "error" not in certs[0]:
+        leaf = certs[0]
+        ts = flow.tls_ts or flow.first_ts
+        if ts > leaf["not_after"]:
+            out.append(("expired", "bold red"))
+        if leaf["self_signed"] and len(certs) == 1:
+            out.append(("self-signed", "dark_orange"))
+        if flow.tls_sni and not x509.name_matches(flow.tls_sni, leaf):
+            out.append(("name mismatch", "bold red"))
+    for a in t.get("alerts", []):
+        if a.startswith("fatal"):
+            out.append((a, "red3"))
+    if not out and (certs or t.get("version")):
+        out.append(("ok", "green3"))
+    return out
+
+
+def tls_table(flows: list[Flow]) -> Table:
+    t = Table(title="TLS sessions", box=box.SIMPLE_HEAVY, header_style="bold", expand=True, title_style="bold")
+    t.add_column("Flow", justify="right", style="grey62", no_wrap=True)
+    t.add_column("Server", no_wrap=True)
+    t.add_column("SNI", overflow="fold")
+    t.add_column("Version", no_wrap=True)
+    t.add_column("Cipher", overflow="fold")
+    t.add_column("Certificate", overflow="fold")
+    t.add_column("Valid until", no_wrap=True)
+    t.add_column("Findings", overflow="fold")
+    for f in flows:
+        tl = f.tls
+        if not tl and not f.tls_sni:
+            continue
+        certs = tl.get("certs") or []
+        leaf = certs[0] if certs and "error" not in certs[0] else None
+        cert = Text()
+        if leaf:
+            cert.append(leaf["subject_cn"] or leaf["subject"], style="bold")
+            cert.append(f"\nby {leaf['issuer_cn'] or leaf['issuer']}", style="grey62")
+            if len(certs) > 1:
+                cert.append(f" (+{len(certs) - 1} in chain)", style="grey50")
+        elif tl.get("version") == "TLS 1.3":
+            cert.append("encrypted (TLS 1.3)", style="grey50")
+        else:
+            cert.append("—", style="grey50")
+        badges = Text()
+        for label, style in tls_findings(f):
+            badges.append(f"{label} ", style=style)
+        t.add_row(str(f.id), f"{f.server[0]}:{f.server[1]}", f.tls_sni or "", tl.get("version", ""),
+                  tl.get("cipher", ""), cert, _date(leaf["not_after"]) if leaf else "", badges)
+    return t
+
+
+def cert_panel(flow: Flow) -> Panel:
+    """Everything the handshake revealed: versions, cipher and each certificate in the chain."""
+    tl = flow.tls
+    g = Table.grid(padding=(0, 2))
+    g.add_column(style="grey62", no_wrap=True)
+    g.add_column()
+    if flow.tls_sni:
+        g.add_row("SNI", flow.tls_sni)
+    if tl.get("alpn"):
+        g.add_row("ALPN offered", tl["alpn"])
+    if tl.get("client_version"):
+        g.add_row("Client offered", f"{tl['client_version']}" + (" + TLS 1.3" if tl.get("offers_tls13") else "")
+                  + (f", {tl['offered_ciphers']} cipher suites" if tl.get("offered_ciphers") else ""))
+    if tl.get("version"):
+        g.add_row("Negotiated", f"{tl['version']}, {tl.get('cipher', '?')}")
+    for i, c in enumerate(tl.get("certs") or []):
+        if "error" in c:
+            g.add_row(f"Cert #{i}", Text(c["error"], style="red3"))
+            continue
+        key = f"{c['key_alg']} {c['key_bits'] or ''}".strip() + (f" ({c['curve']})" if c.get("curve") else "")
+        body = Text.assemble((c["subject"], "bold"), "\n", ("issuer   ", "grey62"), c["issuer"], "\n",
+                             ("valid    ", "grey62"), f"{_date(c['not_before'])} → {_date(c['not_after'])}", "\n",
+                             ("key      ", "grey62"), key, ("   sig ", "grey62"), c["sig_alg"], "\n",
+                             ("serial   ", "grey62"), c["serial"])
+        if c["sans"]:
+            body.append("\nSANs     ", style="grey62")
+            body.append(", ".join(c["sans"][:12]) + (" …" if len(c["sans"]) > 12 else ""))
+        body.append("\nSHA-256  ", style="grey62")
+        body.append(c["sha256"], style="grey50")
+        g.add_row("Leaf cert" if i == 0 else ("CA cert" if c["is_ca"] else f"Cert #{i}"), body)
+    for a in tl.get("alerts", []):
+        g.add_row("TLS alert", Text(a, style="red3"))
+    badges = Text()
+    for label, style in tls_findings(flow):
+        badges.append(f"{label}  ", style=style)
+    if badges:
+        g.add_row("Findings", badges)
+    return Panel(g, title=f"TLS · flow {flow.id}", title_align="left", border_style="gold1")
 
 
 def risk_table(flows: list[Flow], limit: int | None = None, show_all: bool = False) -> Table:

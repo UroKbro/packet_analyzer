@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .http import HttpStreamParser
+from .tls import TlsStreamParser
 from .packet import Packet
 
 WELL_KNOWN = {20, 21, 22, 23, 25, 53, 67, 68, 80, 110, 123, 143, 161, 389, 443, 445, 465, 587, 853,
@@ -52,6 +53,7 @@ class Endpoint:
         self.window = 0
         self.wscale = 0
         self.http = HttpStreamParser()
+        self.tls = TlsStreamParser()
 
     def rel(self, seq: int) -> int:
         return seq_diff(seq, self.isn) if self.isn is not None else 0
@@ -87,6 +89,7 @@ class Flow:
     dns: list = field(default_factory=list)
     tls_sni: str | None = None
     tls_ts: float | None = None       # when the ClientHello carrying the SNI was seen
+    tls: dict = field(default_factory=dict)  # version, cipher, certificate chain, alerts from the handshake
     app: str | None = None
     midstream: bool = False
     history: list = field(default_factory=list)   # state transitions (ts, state)
@@ -132,6 +135,8 @@ class Flow:
                                lost_bytes=ep.lost_bytes, isn=ep.isn)
         if self.tls_sni:
             d["tls_sni"] = self.tls_sni
+        if self.tls:
+            d["tls"] = self.tls
         if self.risk is not None:
             d["risk"] = self.risk.to_dict()
         if self.http:
@@ -159,13 +164,15 @@ class FlowTracker:
         self.by_id: dict[int, Flow] = {}
         self.next_id = 1
         self.udp_timeout = udp_timeout
-        self.listeners: list = []  # callbacks(flow, kind, data) for http/dns/state events
+        self.listeners: list = []  # callbacks(flow, kind, data) for http/dns/tls/state events
+        self.current: Packet | None = None  # packet being processed, for listeners that need it
 
     def _emit(self, flow: Flow, kind: str, data) -> None:
         for cb in self.listeners:
             cb(flow, kind, data)
 
     def process(self, pkt: Packet) -> Flow | None:
+        self.current = pkt
         ip = pkt.ip
         if ip is None:
             return None
@@ -360,6 +367,33 @@ class FlowTracker:
             ep.stream += data[:room]
         for msg in ep.http.feed(data, ts):
             self._http_message(flow, msg, direction)
+        if not ep.tls.dead:
+            for msg in ep.tls.feed(data):
+                self._tls_message(flow, msg, ts)
+
+    def _tls_message(self, flow: Flow, msg: dict, ts: float) -> None:
+        flow.app = "TLS"
+        tls = flow.tls
+        kind = msg["type"]
+        if kind == "ClientHello":
+            tls.update(client_version=msg.get("hello_version"), offered_ciphers=msg.get("cipher_suites"),
+                       offers_tls13=msg.get("offers_tls13", False))
+            for k in ("sni", "alpn"):
+                if msg.get(k):
+                    tls[k] = msg[k]
+            if msg.get("sni"):
+                flow.tls_sni = msg["sni"]
+                flow.tls_ts = flow.tls_ts or ts
+        elif kind == "ServerHello":
+            tls.update(version=msg.get("hello_version"), cipher=msg.get("cipher"),
+                       cipher_code=msg.get("cipher_suite"))
+        elif kind == "Certificate" and msg.get("certs"):
+            tls["certs"] = msg["certs"]
+        elif kind == "Alert":
+            tls.setdefault("alerts", []).append(f"{msg['level']} {msg['description']}")
+        else:
+            return
+        self._emit(flow, "tls", msg)
 
     def _http_message(self, flow: Flow, msg: dict, direction: str) -> None:
         flow.app = flow.app or "HTTP"
