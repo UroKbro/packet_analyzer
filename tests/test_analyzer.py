@@ -1,7 +1,9 @@
 """Unit tests. Run with:  python -m unittest discover -s tests -v"""
+import base64
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -9,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import craft, dns, filters, scoring, timeline, tls, x509                       # noqa: E402
+from pktanalyzer import craft, dns, explain, filters, report, scoring, timeline, tls, x509      # noqa: E402
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -421,6 +423,51 @@ class TestScoring(unittest.TestCase):
         self.assertIn("upload-heavy", text)
 
 
+class TestReport(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            cls.an = Analyzer()
+            for _ in cls.an.run(open_capture(path)):
+                pass
+
+    def test_every_rule_explained(self):
+        import inspect
+        from pktanalyzer import anomalies
+        raised = set(re.findall(r'_fire\([^,]+, "[a-z]+", "([a-z0-9-]+)"', inspect.getsource(anomalies)))
+        self.assertGreater(len(raised), 20)
+        self.assertFalse(raised - set(explain.RULES))
+        groups = explain.group(self.an.alerts)
+        self.assertEqual(sum(g["count"] for g in groups), len(self.an.alerts))
+        self.assertEqual(groups[0]["severity"], "high")
+        self.assertEqual(len({g["rule"] for g in groups}), len(groups))
+
+    def test_html(self):
+        html = report.build_report(self.an, "sample.pcap")
+        self.assertTrue(html.startswith("<!doctype html>"))
+        for needle in ("Executive summary", "Port scan", "Why it matters", "login.paypa1-secure.com", "10.0.0.66",
+                       "<svg", "data:application/json;base64,"):
+            self.assertIn(needle, html)
+        self.assertNotIn("<script", html.lower())  # the report is static and safe to open anywhere
+        # embedded exports decode to valid JSON
+        blobs = re.findall(r'data:application/json;base64,([A-Za-z0-9+/=]+)', html)
+        self.assertGreaterEqual(len(blobs), 4)
+        alerts = json.loads(base64.b64decode(blobs[0]))
+        self.assertEqual(len(alerts), len(self.an.alerts))
+
+    def test_escaping(self):
+        original = self.an.alerts[0].message
+        self.an.alerts[0].message = "<img src=x onerror=alert(1)>"
+        try:
+            html = report.build_report(self.an, "<b>x</b>.pcap")
+        finally:
+            self.an.alerts[0].message = original
+        self.assertNotIn("<img src=x", html)
+        self.assertNotIn("<b>x</b>", html)
+
+
 class TestCLI(unittest.TestCase):
     def test_commands_run(self):
         from pktanalyzer import cli, ui
@@ -432,7 +479,10 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(cli.main(["sample", path]), 0)
             for args in (["read", path], ["read", path, "-f", "http", "-v", "-x"], ["show", path, "8"],
                          ["stats", path], ["flows", path, "--sort", "bytes"], ["follow", path, "2"],
-                         ["alerts", path], ["timeline", path], ["risk", path], ["tls", path, "--certs"], ["flows", path, "--sort", "risk"], ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
+                         ["alerts", path], ["alerts", path, "--explain"], ["timeline", path], ["risk", path],
+                         ["tls", path, "--certs"], ["flows", path, "--sort", "risk"],
+                         ["timeline", path, "-k", "dns,http", "--host", "10.0.0.23"],
+                         ["report", path, "-o", os.path.join(d, "r.html")],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
             self.assertEqual(cli.main(["read", path, "-f", "tcp and ("]), 2)

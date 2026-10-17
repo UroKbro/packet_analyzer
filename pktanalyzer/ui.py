@@ -13,6 +13,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
+from . import timeline as TL
 from .analyzer import Analyzer, info
 from .anomalies import SEVERITY_ORDER, Alert
 from .flows import Flow
@@ -607,6 +608,26 @@ def alerts_table(alerts: list[Alert], t0: float | None = None, limit: int | None
     return t
 
 
+
+def alert_explanations(groups: list[dict], t0: float | None = None) -> Group:
+    """One panel per alert rule: what fired, why it matters and what to do next."""
+    panels = []
+    for g in groups:
+        style = SEV_STYLE[g["severity"]]
+        hosts = ", ".join(g["sources"][:4]) + (f" (+{len(g['sources']) - 4})" if len(g["sources"]) > 4 else "")
+        body = Text.assemble(("Why it matters  ", "grey62"), (g["why"] + "\n", ""),
+                             ("What to do      ", "grey62"), (g["action"] + "\n", "green3"),
+                             ("Sources         ", "grey62"), (hosts, "bold"))
+        if g["flows"]:
+            body.append(Text.assemble(("   flows ", "grey62"), (", ".join(map(str, g["flows"][:6])), "cyan")))
+        for ex in g["examples"]:
+            body.append(Text(f"\n  • {ex}", style="grey70"))
+        first = f"first at {g['first'] - t0:.3f}s" if t0 is not None else ""
+        title = Text.assemble((f"{SEV_ICON[g['severity']]} {g['title']}", style), (f"  ×{g['count']}  ", "bold"),
+                              (f"{g['rule']}  {first}", "grey50"))
+        panels.append(Panel(body, title=title, title_align="left", border_style=style.replace("bold ", "")))
+    return Group(*panels)
+
 def bar(value: float, total: float, width: int = 24, style: str = "cyan") -> Text:
     frac = value / total if total else 0
     full = int(frac * width)
@@ -823,3 +844,65 @@ class Dashboard:
         body = Group(*lines) if lines else Text("nothing suspicious yet", style="green3")
         return Panel(body, title="Alerts", title_align="left",
                      border_style="red" if any(a.severity == "high" for a in alerts) else "grey42")
+
+
+# -- timeline -------------------------------------------------------------------
+def timeline_swimlanes(events: list, t0: float, t1: float, width: int = 80) -> Panel:
+    """Density strip per event kind across the capture's duration."""
+    span = max(t1 - t0, 1e-6)
+    lanes = [k for k in TL.KINDS if any(e.kind == k for e in events)]
+    t = Table.grid(padding=(0, 1))
+    t.add_column(justify="right", style="grey62", no_wrap=True)
+    t.add_column(no_wrap=True)
+    t.add_column(justify="right", style="grey50", no_wrap=True)
+    axis = Text(f"{0:.2f}s", style="grey50")
+    end = f"{span:.2f}s"
+    axis.append("─" * max(1, width - len(axis) - len(end)), style="grey35")
+    axis.append(end, style="grey50")
+    t.add_row("", axis, "")
+    for k in lanes:
+        cells = [0] * width
+        for e in events:
+            if e.kind == k:
+                cells[min(width - 1, int((e.ts - t0) / span * (width - 1)))] += e.count
+        row = Text()
+        for n in cells:
+            if n == 0:
+                row.append("·", style="grey23")
+            else:
+                row.append(TL.KIND_MARK[k] if n < 3 else "█", style=TL.KIND_STYLE[k])
+        t.add_row(Text(k, style=TL.KIND_STYLE[k]), row, str(sum(e.count for e in events if e.kind == k)))
+    return Panel(t, title="Activity by type", title_align="left", border_style="grey42")
+
+
+def timeline_table(events: list, t0: float) -> Table:
+    t = Table(box=box.SIMPLE_HEAVY, header_style="bold", expand=True, show_edge=False)
+    t.add_column("Time", justify="right", style="grey62", no_wrap=True)
+    t.add_column("", no_wrap=True)
+    t.add_column("Event", ratio=4, overflow="fold")
+    t.add_column("Detail", ratio=3, overflow="fold")
+    t.add_column("Latency", no_wrap=True)
+    t.add_column("Flow", justify="right", style="grey50", no_wrap=True)
+    peak = max((e.duration for e in events if e.duration), default=0) or 1
+    for e in events:
+        style = TL.KIND_STYLE[e.kind]
+        level = TL.LEVEL_STYLE[e.level]
+        lat = Text()
+        if e.duration is not None:
+            ms = e.duration * 1000
+            n = max(1, round(e.duration / peak * 8))
+            lat.append("▇" * n, style="red3" if ms > 500 else "yellow3" if ms > 100 else style)
+            lat.append(f" {ms:.1f}ms", style="grey62")
+        t.add_row(f"{e.ts - t0:.4f}", Text(f"{TL.KIND_MARK[e.kind]} {e.kind}", style=style),
+                  Text(e.title, style=level or "white"), Text(e.detail, style="grey70"), lat,
+                  str(e.flow) if e.flow is not None else "")
+    return t
+
+
+def timeline_view(an: Analyzer, events: list, width: int) -> Group:
+    t0 = an.first_ts or 0.0
+    t1 = an.last_ts or t0
+    lane_w = max(20, min(width - 24, 120))
+    if not events:
+        return Group(Text("No events match.", style="grey50"))
+    return Group(timeline_swimlanes(events, t0, t1, lane_w), timeline_table(events, t0))

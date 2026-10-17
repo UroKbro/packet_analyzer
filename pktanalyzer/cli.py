@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from . import __version__, scoring, timeline, ui
+from . import __version__, explain, report, scoring, timeline, ui
 from .analyzer import Analyzer
 from .capture import CaptureError, default_interface, list_interfaces, live_frames
 from .craft import write_sample
@@ -115,7 +115,7 @@ def cmd_timeline(args) -> None:
             con.print(f"[red]Unknown kind(s): {', '.join(bad)}. Choose from {', '.join(timeline.KINDS)}")
             sys.exit(2)
     events = timeline.build(an, kinds, host=args.host, flow_id=args.flow, collapse=not args.no_collapse)
-    con.print(timeline.render(an, events, con.width))
+    con.print(ui.timeline_view(an, events, con.width))
     con.print(Text(f"{len(events)} events · {sum(e.count for e in events)} occurrences", style="grey62"))
 
 
@@ -145,7 +145,17 @@ def cmd_alerts(args) -> None:
     if not an.alerts:
         con.print(Panel(Text("No suspicious traffic detected.", style="green3"), border_style="green3"))
         return
-    con.print(ui.alerts_table(an.alerts, an.first_ts))
+    if args.explain:
+        con.print(ui.alert_explanations(explain.group(an.alerts), an.first_ts))
+    else:
+        con.print(ui.alerts_table(an.alerts, an.first_ts))
+
+
+def cmd_report(args) -> None:
+    an = _analyze(args.file)
+    path = report.write_report(an, args.file, args.out)
+    con.print(f"[green3]Incident report written to [bold]{path}[/] "
+              f"[grey50]({os.path.getsize(path) // 1024} KB, {len(an.alerts)} alerts, {len(an.flows)} flows)")
 
 
 def cmd_export(args) -> None:
@@ -323,7 +333,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     al = sub.add_parser("alerts", help="run the anomaly detector and list findings")
     al.add_argument("file")
+    al.add_argument("-e", "--explain", action="store_true", help="group alerts by rule with why it matters and what to do")
     al.set_defaults(func=cmd_alerts)
+
+    rp = sub.add_parser("report", help="write a self-contained HTML incident report")
+    rp.add_argument("file")
+    rp.add_argument("-o", "--out", default="report.html", help="output file (default: ./report.html)")
+    rp.set_defaults(func=cmd_report)
 
     ex = sub.add_parser("export", help="write flows/packets/alerts/DNS/HTTP as JSON+CSV, streams and a pcap")
     ex.add_argument("file")

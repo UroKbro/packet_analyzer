@@ -8,12 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from rich import box
-from rich.console import Group
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
-
 from .analyzer import Analyzer
 
 KINDS = ("handshake", "dns", "http", "tls", "retrans", "reset", "close", "alert")
@@ -158,65 +152,3 @@ def _collapse(events: list[Event]) -> list[Event]:
             e.detail += f" over {e.duration_span:.2f}s"
             e.level = "bad" if e.count >= 10 else e.level
     return out
-
-
-# -- rendering ------------------------------------------------------------------
-def swimlanes(events: list[Event], t0: float, t1: float, width: int = 80) -> Panel:
-    """Density strip per event kind across the capture's duration."""
-    span = max(t1 - t0, 1e-6)
-    lanes = [k for k in KINDS if any(e.kind == k for e in events)]
-    t = Table.grid(padding=(0, 1))
-    t.add_column(justify="right", style="grey62", no_wrap=True)
-    t.add_column(no_wrap=True)
-    t.add_column(justify="right", style="grey50", no_wrap=True)
-    axis = Text(f"{0:.2f}s", style="grey50")
-    end = f"{span:.2f}s"
-    axis.append("─" * max(1, width - len(axis) - len(end)), style="grey35")
-    axis.append(end, style="grey50")
-    t.add_row("", axis, "")
-    for k in lanes:
-        cells = [0] * width
-        for e in events:
-            if e.kind == k:
-                cells[min(width - 1, int((e.ts - t0) / span * (width - 1)))] += e.count
-        row = Text()
-        for n in cells:
-            if n == 0:
-                row.append("·", style="grey23")
-            else:
-                row.append(KIND_MARK[k] if n < 3 else "█", style=KIND_STYLE[k])
-        t.add_row(Text(k, style=KIND_STYLE[k]), row, str(sum(e.count for e in events if e.kind == k)))
-    return Panel(t, title="Activity by type", title_align="left", border_style="grey42")
-
-
-def table(events: list[Event], t0: float) -> Table:
-    t = Table(box=box.SIMPLE_HEAVY, header_style="bold", expand=True, show_edge=False)
-    t.add_column("Time", justify="right", style="grey62", no_wrap=True)
-    t.add_column("", no_wrap=True)
-    t.add_column("Event", ratio=4, overflow="fold")
-    t.add_column("Detail", ratio=3, overflow="fold")
-    t.add_column("Latency", no_wrap=True)
-    t.add_column("Flow", justify="right", style="grey50", no_wrap=True)
-    peak = max((e.duration for e in events if e.duration), default=0) or 1
-    for e in events:
-        style = KIND_STYLE[e.kind]
-        level = LEVEL_STYLE[e.level]
-        lat = Text()
-        if e.duration is not None:
-            ms = e.duration * 1000
-            n = max(1, round(e.duration / peak * 8))
-            lat.append("▇" * n, style="red3" if ms > 500 else "yellow3" if ms > 100 else style)
-            lat.append(f" {ms:.1f}ms", style="grey62")
-        t.add_row(f"{e.ts - t0:.4f}", Text(f"{KIND_MARK[e.kind]} {e.kind}", style=style),
-                  Text(e.title, style=level or "white"), Text(e.detail, style="grey70"), lat,
-                  str(e.flow) if e.flow is not None else "")
-    return t
-
-
-def render(an: Analyzer, events: list[Event], width: int) -> Group:
-    t0 = an.first_ts or 0.0
-    t1 = an.last_ts or t0
-    lane_w = max(20, min(width - 24, 120))
-    if not events:
-        return Group(Text("No events match.", style="grey50"))
-    return Group(swimlanes(events, t0, t1, lane_w), table(events, t0))
