@@ -605,6 +605,101 @@ class TestHunt(unittest.TestCase):
         self.assertFalse(set(hunt.RULE_FOR.values()) - set(explain.RULES))
 
 
+class TestExplorer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            cls.an = Analyzer()
+            for _ in cls.an.run(open_capture(path)):
+                pass
+
+    def setUp(self):
+        from rich.console import Console
+        from pktanalyzer.explorer import Explorer
+        self.con = Console(width=110, height=30, file=io.StringIO(), color_system=None)
+        self.ex = Explorer(self.an, "s.pcap", self.con)
+
+    def screen(self, w=110, h=30):
+        with self.con.capture() as cap:
+            self.con.print(self.ex.render(w, h))
+        return cap.get()
+
+    def keys(self, *ks):
+        for k in ks:
+            self.assertTrue(self.ex.handle_key(k), k)
+
+    def test_navigation_and_details(self):
+        self.assertIn("Where to go next", self.screen())
+        self.keys("2", "j", "j", "j", "enter")
+        self.assertEqual(self.ex.stack[-1].item.number, 4)
+        self.assertIn("packet #4", self.screen())
+        self.keys("n")
+        self.assertEqual(self.ex.stack[-1].item.number, 5)
+        self.keys("f")
+        self.assertEqual(self.ex.stack[-1].kind, "flow")
+        self.assertIn("Conversation ladder", self.screen())
+        self.keys("esc", "esc")
+        self.assertFalse(self.ex.stack)
+        self.assertEqual(self.ex.state.cursor, 4)
+        self.keys("G")
+        self.assertEqual(self.ex.state.cursor, len(self.ex.packets) - 1)
+        self.keys("5", "enter")
+        self.assertIn("Why it matters", self.screen())
+        self.keys("f")
+        self.assertEqual(self.ex.stack[-1].kind, "flow")
+        self.keys("tab")
+        self.assertEqual(self.ex.tab_name, "Timeline")
+        self.keys("btab", "btab")
+        self.assertEqual(self.ex.tab_name, "Hosts")
+        self.keys("enter")
+        self.assertIn("Conversations of", self.screen())
+        self.keys("?")
+        self.assertIn("Keyboard shortcuts", self.screen())
+        self.keys("x")
+        self.assertFalse(self.ex.show_help)
+        self.assertIn("No beaconing", (self.keys("7"), self.screen())[1])
+        self.assertFalse(self.ex.handle_key("q"))
+
+    def test_filters_and_sort(self):
+        self.keys("2", "/", *"dns", "enter")
+        self.assertTrue(self.ex.state.items)
+        self.assertTrue(all(p.has("dns") for p in self.ex.state.items))
+        self.assertIn("matches for", self.screen())
+        n = len(self.ex.state.items)
+        self.keys("/", *"tcp and (", "enter")
+        self.assertTrue(self.ex.message.startswith("Filter error"))
+        self.assertEqual((self.ex.state.query, len(self.ex.state.items)), ("dns", n))  # bad filter keeps the last
+        self.keys("c")
+        self.assertEqual(len(self.ex.state.items), len(self.ex.packets))
+        self.keys("/", *"nope", "esc")
+        self.assertEqual(self.ex.state.query, "")
+        self.keys("4", "/", *"scanner", "enter")
+        self.assertEqual([h.addr for h in self.ex.state.items], ["10.0.0.66"])
+        self.keys("3", "s")
+        risks = [f.risk.score for f in self.ex.state.items]
+        self.assertEqual(risks, sorted(risks, reverse=True))
+
+    def test_every_view_fits(self):
+        for w, h in ((80, 24), (140, 45)):
+            for tab in "1234567":
+                self.keys(tab)
+                lines = self.screen(w, h).rstrip("\n").split("\n")
+                self.assertEqual(len(lines), h, (tab, w))
+                self.assertTrue(all(len(line) <= w for line in lines), (tab, w))
+                if tab != "1" and self.ex.state.items:
+                    self.keys("enter", "pgdn", "G")
+                    self.assertEqual(len(self.screen(w, h).rstrip("\n").split("\n")), h)
+                    self.keys("esc")
+
+    def test_decode_keys(self):
+        from pktanalyzer.explorer import decode_keys
+        self.assertEqual(decode_keys("\x1b[A\x1b[B\x1b[5~\x1b[6~\x1b[Z\x1b\r\tq/"),
+                         ["up", "down", "pgup", "pgdn", "btab", "esc", "enter", "tab", "q", "/"])
+        self.assertEqual(decode_keys("\x1bOH\x7f"), ["home", "backspace"])
+
+
 class TestReport(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -668,14 +763,17 @@ class TestCLI(unittest.TestCase):
                          ["sample", "--baseline", os.path.join(d, "b.pcap")],
                          ["diff", os.path.join(d, "b.pcap"), path, "--json", os.path.join(d, "d.json")],
                          ["sample", "--c2", os.path.join(d, "c2.pcap")], ["hunt", os.path.join(d, "c2.pcap")],
-                         ["hunt", path],
+                         ["hunt", path], [path], ["explore", path], ["demo"], ["demo", "--c2"],
                          ["report", path, "-o", os.path.join(d, "r.html")],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
             self.assertEqual(cli.main(["read", path, "-f", "tcp and ("]), 2)
+            self.assertEqual(cli.main([]), 0)
             out = buf.getvalue()
             self.assertIn("GET", out)
             self.assertIn("Port scan", out)
+            self.assertIn("pktanalyzer demo", out)    # the welcome screen
+            self.assertIn("interactive terminal", out)  # explore falls back to a summary when piped
 
 
 if __name__ == "__main__":

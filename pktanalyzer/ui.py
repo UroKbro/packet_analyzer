@@ -847,6 +847,8 @@ class Dashboard:
         self._last_count = 0
         self._last_tick = time.time()
         self.paused = False
+        self.finished = False   # a replay reached the end of the file
+        self.keys = False       # keyboard control available
         self.shown = 0
 
     def add(self, pkt: Packet) -> None:
@@ -878,8 +880,26 @@ class Dashboard:
         layout["protos"].update(Panel(self._protos(), title="Protocols", title_align="left",
                                       border_style="steel_blue1"))
         layout["alerts"].update(self._alerts(low_h - 2))
-        layout["foot"].update(Text(" Ctrl-C to stop · a full summary is printed on exit", style="grey50"))
+        layout["foot"].update(self._footer())
         return layout
+
+    def _footer(self) -> Text:
+        if not self.keys:
+            return Text(" Ctrl-C to stop · a full summary is printed on exit", style="grey50")
+        keys = [("q", "quit and show the summary"), ("space", "resume" if self.paused else "pause")]
+        if self.finished:
+            keys = [("e", "explore this capture"), ("q", "quit and show the summary")]
+        t = Text(no_wrap=True, overflow="ellipsis")
+        if self.paused:
+            t.append(" PAUSED ", style="bold black on yellow")
+            t.append(" ")
+        elif self.finished:
+            t.append(" REPLAY DONE ", style="bold black on green3")
+            t.append(" ")
+        for k, label in keys:
+            t.append(f" {k} ", style="bold black on grey70")
+            t.append(f" {label}  ")
+        return t
 
     def _header(self) -> Panel:
         an = self.an

@@ -208,6 +208,58 @@ def cmd_export(args) -> None:
         con.print(f"  [grey62]•[/] {name:<14} [grey50]{path}")
 
 
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def cmd_explore(args) -> None:
+    an = _analyze(args.file)
+    if not _interactive():
+        con.print("[yellow]The explorer needs an interactive terminal; showing the summary instead.[/]")
+        ui.print_stats(an, args.file)
+        return
+    from .explorer import run
+    run(an, args.file, con)
+
+
+def cmd_demo(args) -> None:
+    import tempfile
+    folder = tempfile.mkdtemp(prefix="pktanalyzer-demo-")
+    path = os.path.join(folder, "c2-demo.pcap" if args.c2 else "demo.pcap")
+    if args.c2:
+        from .craft import write_c2_sample
+        write_c2_sample(path)
+    else:
+        write_sample(path)
+    con.print(f"[green3]Made a demo capture at [bold]{path}[/][/]")
+    args.file = path
+    cmd_explore(args)
+
+
+WELCOME = [
+    ("Try it on demo traffic", "pktanalyzer demo", "a scan, ARP spoofing, a phishing site and more"),
+    ("…or a hacked laptop", "pktanalyzer demo --c2", "beaconing and data leaving the network"),
+    ("Open a capture file", "pktanalyzer capture.pcap", "browse it with the keyboard (? shows the keys)"),
+    ("Watch your network live", "sudo pktanalyzer live", "full-screen dashboard"),
+    ("Record traffic to a file", "sudo pktanalyzer capture -w out.pcap", "Ctrl-C to stop"),
+    ("Make a shareable report", "pktanalyzer report capture.pcap", "one HTML file"),
+    ("Compare two captures", "pktanalyzer diff before.pcap after.pcap", "what appeared or changed"),
+    ("Every command", "pktanalyzer --help", ""),
+]
+
+
+def welcome() -> None:
+    from rich.table import Table
+    t = Table.grid(padding=(0, 3))
+    t.add_column(style="bold cyan", no_wrap=True)
+    t.add_column()
+    for what, cmd, note in WELCOME:
+        t.add_row(cmd, Text.assemble((what, "bold"), (f"\n{note}" if note else "", "grey62")))
+    con.print(Panel(t, title=f"[bold]pktanalyzer {__version__}[/] · a packet analyzer you can read",
+                    subtitle="only capture networks you own or may monitor", border_style="cyan",
+                    title_align="left", padding=(1, 2)))
+
+
 def cmd_sample(args) -> None:
     if args.c2:
         from .craft import write_c2_sample
@@ -282,14 +334,27 @@ def cmd_capture(args) -> None:
 
 def cmd_live(args) -> None:
     """Full-screen dashboard over a live interface or a replayed capture file."""
+    import contextlib
     pred = compile_filter(args.filter)
     frames, source = _live_source(args)
     an = Analyzer(verify_checksums=args.checksums, keep_packets=False)
     dash = ui.Dashboard(an, source, pred)
     writer = PcapWriter(args.write) if args.write else None
+    explore_after = False
+    if _interactive():
+        from .explorer import KeyReader
+        reader = KeyReader()
+        dash.keys = True
+    else:
+        reader = contextlib.nullcontext()
+
+    def pressed(timeout: float = 0.0) -> list[str]:
+        return reader.read(timeout) if dash.keys else []
+
     last = 0.0
     try:
-        with Live(dash.render(), console=con, screen=True, refresh_per_second=8, transient=False) as live:
+        with reader, Live(dash.render(), console=con, screen=True, refresh_per_second=8, transient=False) as live:
+            quit_now = False
             for frame in frames:
                 if frame is not None:
                     if writer:
@@ -297,27 +362,68 @@ def cmd_live(args) -> None:
                     dash.add(an.feed(frame))
                 now = time.time()
                 if now - last > 0.12:
-                    live.update(dash.render())
+                    for k in pressed():
+                        if k == "q":
+                            quit_now = True
+                        elif k == " ":
+                            dash.paused = not dash.paused
+                    # a paused replay stops reading; a paused live capture keeps counting but freezes the view
+                    while dash.paused and args.read and not quit_now:
+                        live.update(dash.render())
+                        for k in pressed(0.25):
+                            if k == "q":
+                                quit_now = True
+                            elif k == " ":
+                                dash.paused = False
+                    if quit_now:
+                        break
+                    if not dash.paused:
+                        live.update(dash.render())
                     last = now
+            dash.paused = False
             live.update(dash.render())
-            if args.read:
+            if args.read and not quit_now:
                 # replay finished: keep the final picture up until the user quits
+                dash.finished = True
                 while True:
-                    time.sleep(0.25)
                     live.update(dash.render())
+                    keys = pressed(0.25) if dash.keys else (time.sleep(0.25) or [])
+                    if "q" in keys:
+                        break
+                    if "e" in keys:
+                        explore_after = True
+                        break
     except KeyboardInterrupt:
         pass
     finally:
         if writer:
             writer.close()
+    if explore_after:
+        from .explorer import run
+        run(_analyze(args.read), args.read, con)
+        return
     ui.print_stats(an, source)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="pktanalyzer",
-                                description="A from-scratch packet sniffer and protocol analyzer.")
+    p = argparse.ArgumentParser(
+        prog="pktanalyzer", description="A from-scratch packet sniffer and protocol analyzer.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n  pktanalyzer demo                    explore demo traffic with the keyboard\n"
+               "  pktanalyzer capture.pcap            explore a capture (same as: explore capture.pcap)\n"
+               "  sudo pktanalyzer live               live dashboard\n"
+               "  pktanalyzer report capture.pcap     HTML incident report\n"
+               "  pktanalyzer COMMAND -h              help for one command")
     p.add_argument("--version", action="version", version=f"pktanalyzer {__version__}")
     sub = p.add_subparsers(dest="command", required=True, metavar="command")
+
+    xp = sub.add_parser("explore", help="browse a capture interactively with the keyboard (? shows the keys)")
+    xp.add_argument("file")
+    xp.set_defaults(func=cmd_explore)
+
+    dm = sub.add_parser("demo", help="make a demo capture and open it in the explorer")
+    dm.add_argument("--c2", action="store_true", help="a compromised host (beaconing, exfiltration) instead")
+    dm.set_defaults(func=cmd_demo)
 
     r = sub.add_parser("read", help="list packets in a pcap/pcapng file")
     r.add_argument("file")
@@ -441,7 +547,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        welcome()
+        return 0
+    parser = build_parser()
+    commands = next(a.choices for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    if argv[0] not in commands and not argv[0].startswith("-") and os.path.isfile(argv[0]):
+        argv.insert(0, "explore")  # `pktanalyzer capture.pcap` opens the explorer
+    args = parser.parse_args(argv)
     try:
         args.func(args)
     except FilterError as e:

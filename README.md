@@ -4,12 +4,44 @@ A from-scratch network packet sniffer and protocol analyzer for the terminal: a 
 
 Every header is parsed by hand with `struct`. There's no scapy and no libpcap. The tool reads raw frames from a live raw socket or from a `.pcap`/`.pcapng` file, peels them apart layer by layer (Ethernet → IP → TCP/UDP → DNS/HTTP/TLS), rebuilds TCP conversations, flags suspicious traffic and exports everything it learned.
 
+![explorer](docs/explorer.svg)
+
+## Start here
+
+```bash
+pip3 install -r requirements.txt
+python3 -m pktanalyzer demo          # make demo traffic and open it in the explorer
+python3 -m pktanalyzer capture.pcap  # open your own capture the same way
+python3 -m pktanalyzer               # a short menu of the most useful commands
+```
+
+The explorer is driven entirely from the keyboard, and the bottom line always shows the keys that work where you are:
+
+| Key | What it does |
+|---|---|
+| `1` … `7` | Overview, Packets, Conversations, Hosts, Alerts, Timeline, Hunt (`Tab` / `Shift-Tab` cycle) |
+| `↑` `↓` (or `j` `k`), `PgUp` `PgDn`, `g` `G` | move, page, jump to top/bottom |
+| `Enter` | open the selected packet, conversation, host, alert or finding |
+| `Esc` (or `←`) | go back |
+| `n` / `p` | next / previous item without leaving the detail |
+| `/` | filter the list; on Packets it takes display filters like `dns` or `tcp.port == 443` |
+| `c` | clear the filter |
+| `f` | follow the conversation behind a packet, alert or finding |
+| `s` | sort conversations by time, risk or bytes |
+| `x` | hex dump on/off |
+| `r` | write the HTML incident report and open it in the browser |
+| `?` | all shortcuts |
+| `q` | quit |
+
+The live dashboard takes keys too: `space` pauses, `q` quits, and when a replay (`live -r file`) finishes, `e` opens the capture in the explorer.
+
 ![live dashboard](docs/dashboard.svg)
 
 ## Features
 
 | Area | What it does |
 |---|---|
+| **Explorer** | `explore FILE` (or just `pktanalyzer FILE`) opens a full-screen, keyboard-driven browser over packets, conversations, hosts, alerts, the timeline and hunt findings, with filters, drill-down from any alert to its conversation, and a report key |
 | **Capture** | Live capture with raw sockets: `AF_PACKET` on Linux, the BPF device (`/dev/bpf*`) on macOS. It also reads pcap (µs/ns, either byte order) and pcapng, and writes pcap. |
 | **Link / network** | Ethernet II, 802.1Q/QinQ VLANs, Linux cooked capture, BSD loopback, ARP, IPv4 (options, checksum validation), IPv6 (extension-header chain walking) |
 | **Fragmentation** | Reassembles fragmented IPv4 and IPv6 datagrams, and detects overlapping fragments (teardrop) and oversize fragments (ping of death) |
@@ -43,6 +75,7 @@ It needs Python 3.10 or newer. You can also run `pip3 install -e .` to get a `pk
 
 ```bash
 python3 -m pktanalyzer sample sample.pcap      # writes a demo capture with normal traffic and attacks
+python3 -m pktanalyzer sample.pcap             # explore it interactively (? lists the keys)
 python3 -m pktanalyzer read sample.pcap        # packet list
 python3 -m pktanalyzer stats sample.pcap       # summary: hierarchy, talkers, flows, HTTP, DNS, alerts
 python3 -m pktanalyzer flows sample.pcap       # conversations with state and RTT
@@ -115,6 +148,7 @@ pktanalyzer/
 ├── timeline.py   time-ordered event view (handshakes, DNS, HTTP, TLS, resets, alerts)
 ├── hosts.py      per-host profiles: names, MAC, OS guess, roles, services, lookups, alerts
 ├── hunt.py       beaconing and exfiltration detection across the whole capture
+├── explorer.py   interactive keyboard-driven explorer (state machine + terminal key reader)
 ├── diff.py       compares two captures (flows, DNS, TLS, alerts, hosts, ports, bandwidth)
 ├── explain.py    plain-language "why it matters / what to do" for every alert rule
 ├── report.py     self-contained HTML incident report
@@ -141,6 +175,6 @@ The tests build packets byte by byte with `craft.py` and cover pcap/pcapng parsi
 | ![read](docs/read.svg) | ![follow](docs/follow.svg) |
 | ![show](docs/show.svg) | ![alerts](docs/alerts.svg) |
 | ![hunt](docs/hunt.svg) | ![hosts](docs/hosts.svg) |
-| ![diff](docs/diff.svg) | |
+| ![diff](docs/diff.svg) | ![explorer alert](docs/explorer-alert.svg) |
 
 ## Only sniff networks you own or have permission to monitor.
