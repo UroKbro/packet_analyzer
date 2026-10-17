@@ -677,16 +677,34 @@ def http_table(flows: list[Flow]) -> Table:
 
 
 def dns_table(flows: list[Flow]) -> Table:
+    """DNS answers with identical repeats folded into one row and a count, mDNS shown in plain words."""
     t = Table(title="DNS", box=box.SIMPLE_HEAVY, header_style="bold", expand=True)
     for c in ("Flow", "ID", "Query", "Type", "Result"):
         t.add_column(c, overflow="fold")
+    t.add_column("Seen", justify="right", no_wrap=True)
+    rows: dict[tuple, list] = {}
     for f in flows:
         for d in f.dns:
             if not d["response"]:
                 continue
-            res = ", ".join(map(str, d["answers"])) or d["rcode"]
-            t.add_row(str(f.id), f"0x{d['id']:04x}", d["qname"] or "", d["qtype"] or "",
-                      Text(res, style="red3" if d["rcode"] != "NOERROR" else "magenta"))
+            if d.get("meaning"):
+                key = ("mdns", d["meaning"])
+                cells = ("(mDNS announcement)", "", d["meaning"].removeprefix("mDNS: "), "green3")
+            else:
+                res = ", ".join(map(str, d["answers"])) or d["rcode"]
+                key = (d["qname"], d["qtype"], res)
+                cells = (d["qname"] or "", d["qtype"] or "", res, "red3" if d["rcode"] != "NOERROR" else "magenta")
+            row = rows.get(key)
+            if row is None:
+                rows[key] = [[f.id], d["id"], cells, 1]
+            else:
+                row[3] += 1
+                if f.id not in row[0]:
+                    row[0].append(f.id)
+    for ids, ident, (q, qt, res, style), n in rows.values():
+        fl = ", ".join(map(str, ids[:3])) + (" …" if len(ids) > 3 else "")
+        t.add_row(fl, f"0x{ident:04x}", q, qt, Text(res, style=style), Text(f"×{n}", style="bold yellow3") if n > 1
+                  else "")
     return t
 
 
@@ -815,7 +833,11 @@ def _kv(k: str, v: str) -> Text:
 
 
 def print_stats(an: Analyzer, source: str, con: Console | None = None) -> None:
+    from . import story
     con = con or console
+    if an.count:
+        con.print(Panel(Text(" ".join(story.summarize(an)["headline"])), title="[bold]In plain English[/]",
+                        title_align="left", border_style="cyan", box=box.ROUNDED))
     con.print(summary_panel(an, source))
     side = Table.grid(expand=True, padding=(0, 2))
     side.add_column(ratio=3)
@@ -850,6 +872,7 @@ class Dashboard:
         self.finished = False   # a replay reached the end of the file
         self.keys = False       # keyboard control available
         self.shown = 0
+        self.story = False      # show grouped plain-English events instead of raw packets
 
     def add(self, pkt: Packet) -> None:
         if self.filter(pkt):
@@ -875,7 +898,7 @@ class Dashboard:
         layout["bottom"].split_row(Layout(name="flows", ratio=6), Layout(name="alerts", ratio=5),
                                    Layout(name="protos", ratio=3))
         layout["head"].update(self._header())
-        layout["packets"].update(self._packets(pkt_h - 2))
+        layout["packets"].update(self._story(pkt_h - 2) if self.story else self._packets(pkt_h - 2))
         layout["flows"].update(self._flows(low_h - 3))
         layout["protos"].update(Panel(self._protos(), title="Protocols", title_align="left",
                                       border_style="steel_blue1"))
@@ -886,9 +909,10 @@ class Dashboard:
     def _footer(self) -> Text:
         if not self.keys:
             return Text(" Ctrl-C to stop · a full summary is printed on exit", style="grey50")
-        keys = [("q", "quit and show the summary"), ("space", "resume" if self.paused else "pause")]
+        toggle = ("s", "show packets" if self.story else "plain English")
+        keys = [("q", "quit and show the summary"), ("space", "resume" if self.paused else "pause"), toggle]
         if self.finished:
-            keys = [("e", "explore this capture"), ("q", "quit and show the summary")]
+            keys = [("e", "explore this capture"), toggle, ("q", "quit and show the summary")]
         t = Text(no_wrap=True, overflow="ellipsis")
         if self.paused:
             t.append(" PAUSED ", style="bold black on yellow")
@@ -926,6 +950,16 @@ class Dashboard:
         lines = [packet_line(p, t0, widths) for p in list(self.recent)[-rows:]]
         return Panel(Group(*lines) if lines else Text("waiting for packets…", style="grey50"),
                      title="Packets", title_align="left", border_style="grey42")
+
+    def _story(self, rows: int) -> Panel:
+        width = max(40, console.width - 4)
+        nar = self.an.narrator
+        events = nar.recent(max(1, rows))
+        now = self.an.last_ts or 0
+        lines = [story_line(nar, ev, width, now) for ev in events]
+        return Panel(Group(*lines) if lines else Text("waiting for packets…", style="grey50"),
+                     title="What's happening  [grey50](newest first, repeats grouped)[/]", title_align="left",
+                     border_style="cyan")
 
     def _flows(self, rows: int) -> Panel:
         flows = sorted(self.an.tracker.by_id.values(), key=lambda f: -f.last_ts)[:max(1, rows)]
@@ -1162,3 +1196,181 @@ def hunt_view(findings: list, t0: float, t1: float, width: int = 100) -> Group:
         parts.append(Panel(Group(*items), title=title, title_align="left",
                            border_style=SEV_STYLE[sev].replace("bold ", "")))
     return Group(*parts)
+
+
+# -- plain-English story ----------------------------------------------------------
+CAT_STYLE = {"alert": "bold red", "web": "cyan", "connect": "magenta", "lookup": "medium_purple1",
+             "network": "grey62", "discovery": "green3", "more": "grey50"}
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.0f}h"
+
+
+def story_line(nar, ev, width: int, t_ref: float | None = None, wrap: bool = False) -> Text:
+    """One grouped event: a category tag, the sentence and how often it happened."""
+    from .story import CATEGORY_LABEL, shown_count
+    cat = ev.category
+    style = SEV_STYLE.get(ev.severity, CAT_STYLE[cat]) if cat == "alert" else CAT_STYLE[cat]
+    t = Text(no_wrap=not wrap, overflow="fold" if wrap else "ellipsis")
+    if t_ref is not None:
+        t.append(f"{_ago(max(0.0, t_ref - ev.last_ts)):>4} ", style="grey50")
+    t.append(f"{CATEGORY_LABEL[cat][:9]:<9} ", style=style)
+    t.append(nar.describe(ev), style="bold" if cat == "alert" else "")
+    n = shown_count(ev)
+    if n > 1:
+        t.append(f"  ×{n}", style="bold yellow3")
+    if not wrap:
+        t.truncate(max(10, width), overflow="ellipsis")
+    return t
+
+
+def story_view(an: Analyzer, width: int = 100, summary: dict | None = None) -> Group:
+    """The whole capture as a short, readable summary."""
+    from . import story
+    s = summary or story.summarize(an)
+    parts = [Panel(Text(" ".join(s["headline"])), title="[bold]What happened[/]", title_align="left",
+                   border_style="cyan", box=box.ROUNDED)]
+    if s["concerns"]:
+        body = Text()
+        for c in s["concerns"][:8]:
+            body.append(f"{SEV_ICON[c['severity']]} ", style=SEV_STYLE[c["severity"]])
+            body.append(c["title"], style="bold")
+            if c["count"] > 1:
+                body.append(f" ×{c['count']}", style="bold yellow3")
+            if c["who"]:
+                body.append(f"  from {', '.join(c['who'][:2])}", style="grey62")
+            body.append(f"\n   {c['why'].split('. ')[0].rstrip('.')}.\n", style="grey70")
+        if len(s["concerns"]) > 8:
+            body.append(f"… and {len(s['concerns']) - 8} more kinds of warning (see the alerts view)\n", style="grey62")
+        body.rstrip()
+        high = any(c["severity"] == "high" for c in s["concerns"])
+        parts.append(Panel(body, title="[bold]What to look at[/]", title_align="left",
+                           border_style="red3" if high else "dark_orange", box=box.ROUNDED))
+    else:
+        parts.append(Panel(Text("Nothing suspicious stood out.", style="green3"), border_style="green3"))
+    if s["devices"]:
+        body = Text()
+        inner = max(30, width - 6)
+        for d in s["devices"][:12]:
+            body.append(d["title"], style="bold")
+            if d["desc"]:
+                body.append(f"  {d['desc']}", style="grey62")
+            body.append("\n")
+            for cat, line, count in d["lines"]:
+                body.append("  • ", style=CAT_STYLE.get(cat, "white"))
+                room = inner - 4 - (len(f"  ×{count}") if count > 1 else 0)
+                body.append(line if len(line) <= room else line[:room - 1] + "…")
+                if count > 1:
+                    body.append(f"  ×{count}", style="bold yellow3")
+                body.append("\n")
+        if len(s["devices"]) > 12:
+            body.append(f"… and {len(s['devices']) - 12} more devices\n", style="grey62")
+        body.rstrip()
+        parts.append(Panel(body, title="[bold]Who did what[/]", title_align="left", border_style="steel_blue1",
+                           box=box.ROUNDED))
+    if s["nearby"]:
+        t = Table(box=box.SIMPLE, header_style="bold", expand=True, padding=(0, 1))
+        t.add_column("Device", style="bold", ratio=3, overflow="fold")
+        t.add_column("Address", no_wrap=True)
+        t.add_column("What it is", ratio=3, overflow="fold")
+        t.add_column("Offers", ratio=4, overflow="fold")
+        t.add_column("Seen", justify="right", no_wrap=True)
+        for d in s["nearby"][:20]:
+            what = d.kind + (f" · {d.os}" if d.os else "")
+            t.add_row(d.name or "—", d.addr, what, ", ".join(d.labels) or "—", f"×{d.announcements}")
+        parts.append(Panel(t, title="[bold]Devices that announced themselves[/]", title_align="left",
+                           border_style="green3", box=box.ROUNDED))
+    for b in s["background"]:
+        parts.append(Text(b, style="grey50"))
+    return Group(*parts)
+
+
+def story_page(nar, ev, t0: float | None) -> Group:
+    """Detail for one grouped event, with decoded mDNS records for a device announcement."""
+    from . import discovery
+    t0 = t0 or ev.first_ts
+    head = Text()
+    head.append(nar.describe(ev) + "\n", style="bold")
+    meaning = nar.meaning(ev)
+    if meaning:
+        head.append(meaning + "\n", style="grey70")
+    head.append(f"\nHappened {ev.count}× between {ev.first_ts - t0:.2f}s and {ev.last_ts - t0:.2f}s", style="grey62")
+    if ev.packets:
+        head.append(f"\nPackets {', '.join(map(str, ev.packets))}" + (" …" if ev.count > len(ev.packets) else ""),
+                    style="cyan")
+    from .story import CATEGORY_LABEL
+    parts = [Panel(head, title=f"[bold]{CATEGORY_LABEL[ev.category]}[/]", title_align="left", border_style="cyan")]
+    if ev.items and ev.kind in ("lookup", "arp", "http", "alert"):
+        label = {"lookup": "Names looked up", "arp": "Addresses asked about", "http": "Pages",
+                 "alert": "Targets"}[ev.kind]
+        parts.append(Panel(Text("\n".join(list(ev.items)[:60])), title=label, title_align="left",
+                           border_style="grey42"))
+    if ev.kind == "search":
+        t = Table(box=box.SIMPLE, header_style="bold", expand=True)
+        t.add_column("Asked for", style="bold")
+        t.add_column("Meaning")
+        for item in ev.items:
+            if item.startswith("ssdp:"):
+                t.add_row(item[5:], discovery.ssdp_target(item[5:]))
+            else:
+                t.add_row(item, discovery.search_meaning(item))
+        parts.append(t)
+    dev = nar.an.discovery.devices.get(ev.src) if ev.kind == "announce" else None
+    if dev is not None:
+        info = Table.grid(padding=(0, 2))
+        info.add_column(style="grey62")
+        info.add_column()
+        for k, v in (("Name", dev.name), ("Model", f"{dev.model_name}" + (f"  ({dev.model})" if dev.model and
+                                                                          dev.model != dev.model_name else "")),
+                     ("Software", dev.os), ("Hostname", dev.hostname), ("Other addresses", ", ".join(sorted(dev.addrs))),
+                     ("UPnP server", dev.server)):
+            if v:
+                info.add_row(k, v)
+        parts.append(Panel(info, title="Device", title_align="left", border_style="green3"))
+        for svc, entry in dev.services.items():
+            t = Table(box=box.SIMPLE, header_style="bold", expand=True, padding=(0, 1))
+            t.add_column("Key", style="bold cyan", no_wrap=True)
+            t.add_column("Value", overflow="fold", ratio=3)
+            t.add_column("What it means", overflow="fold", ratio=3, style="grey70")
+            for k, v, m in discovery.explain_txt(entry["txt"]):
+                t.add_row(k, v, m)
+            title = f"{discovery.service_label(svc)} ({svc}" + (f", port {entry['port']}" if entry["port"] else "") \
+                + f") · it {discovery.service_meaning(svc)}"
+            parts.append(Panel(t if entry["txt"] else Text("no extra details", style="grey50"), title=title,
+                               title_align="left", border_style="grey42"))
+    return Group(*parts)
+
+
+def mdns_panel(fields: dict) -> Panel:
+    """A plain-English reading of one mDNS packet, with every TXT key explained."""
+    from . import discovery
+    m = discovery.interpret_mdns(fields)
+    parts = [Text(discovery.mdns_summary(fields).removeprefix("mDNS: "), style="bold")]
+    if not m["response"] and m["asks"]:
+        parts.append(Text("A device is asking the local network: is anyone here offering "
+                          + ", ".join(discovery.search_meaning(a) for a in m["asks"]) + "?", style="grey70"))
+    for svc in m["services"]:
+        line = Text.assemble(("• ", "green3"), (discovery.service_label(svc), "bold"), f" ({svc}"
+                             + (f", port {m['ports'][svc]}" if svc in m["ports"] else "") + "): it "
+                             + discovery.service_meaning(svc))
+        parts.append(line)
+        txt = m["txt"].get(svc)
+        if txt:
+            t = Table(box=None, show_header=False, padding=(0, 1), expand=True)
+            t.add_column(style="bold cyan", no_wrap=True)
+            t.add_column(overflow="fold", ratio=3)
+            t.add_column(style="grey70", overflow="fold", ratio=3)
+            for k, v, meaning in discovery.explain_txt(txt):
+                t.add_row("   " + k, v, meaning)
+            parts.append(t)
+    if m["addrs"]:
+        parts.append(Text(f"Addresses: {', '.join(sorted(m['hostnames']))} → {', '.join(sorted(m['addrs']))}",
+                          style="grey62"))
+    parts.append(Text("This is Bonjour/mDNS: devices telling each other what they are. It is normal background "
+                      "traffic.", style="grey50"))
+    return Panel(Group(*parts), title="[bold]In plain English[/]", title_align="left", border_style="green3")

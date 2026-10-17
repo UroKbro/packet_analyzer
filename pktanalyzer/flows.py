@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import discovery
 from .http import HttpStreamParser
 from .tls import TlsStreamParser
 from .packet import Packet
@@ -420,6 +421,8 @@ class FlowTracker:
             flow.app = flow.app or ("mDNS" if d.name == "mdns" else "DNS")
             rec = dict(ts=pkt.ts, id=d["id"], response=d["response"], qname=d.get("qname"),
                        qtype=d.get("qtype"), rcode=d["rcode_name"], answers=d["answer_data"])
+            if d.name == "mdns" and d["response"]:
+                rec["meaning"] = discovery.mdns_summary(d.fields)
             if len(flow.dns) < 1000:
                 flow.dns.append(rec)
             self._emit(flow, "dns", rec)

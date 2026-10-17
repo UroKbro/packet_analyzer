@@ -199,6 +199,41 @@ def bars(rows: list[tuple[str, float, str]], color: str = "var(--accent)") -> st
 
 
 # -- the report -------------------------------------------------------------------
+CAT_COLOR = {"alert": "#d64545", "web": "#2f7fc1", "connect": "#9b59b6", "lookup": "#7d6bd6", "network": "#7f8c8d",
+             "discovery": "#2e9e5b", "more": "#7f8c8d"}
+
+
+def plain_english(an: Analyzer) -> str:
+    """The story module's summary as HTML: what happened, who did what, and the devices that announced themselves."""
+    from . import discovery, story
+    s = story.summarize(an)
+    out = [f'<p style="font-size:15px">{_e(" ".join(s["headline"]))}</p>']
+    cards = []
+    for d in s["devices"][:24]:
+        items = "".join(f'<li><span class="badge" style="background:{CAT_COLOR.get(cat, "#7f8c8d")}">'
+                        f'{_e(story.CATEGORY_LABEL.get(cat, "More"))}</span> {_e(line)}'
+                        + (f' <b>×{n}</b>' if n > 1 else "") + "</li>" for cat, line, n in d["lines"])
+        cards.append(f'<div class="card" style="--c:var(--accent)"><b>{_e(d["title"])}</b>'
+                     f'<div class="muted">{_e(d["desc"])}</div><ul style="list-style:none;padding-left:0">{items}</ul></div>')
+    if cards:
+        out.append(f'<h3 style="margin:18px 0 8px">Who did what</h3><div class="cards" style="align-items:start">{"".join(cards)}</div>')
+    if s["nearby"]:
+        rows = []
+        for d in s["nearby"]:
+            txt = "".join(
+                f'<details><summary>{_e(discovery.service_label(svc))} details</summary><table>'
+                + "".join(f'<tr><td class="mono">{_e(k)}</td><td class="mono wrap">{_e(v)}</td><td class="muted">{_e(m)}'
+                          f'</td></tr>' for k, v, m in discovery.explain_txt(e["txt"])) + "</table></details>"
+                for svc, e in d.services.items() if e["txt"])
+            rows.append(f'<tr><td><b>{_e(d.name or "—")}</b></td><td class="mono">{_e(d.addr)}</td>'
+                        f'<td>{_e(d.kind)}{" · " + _e(d.os) if d.os else ""}</td><td class="wrap">{_e(", ".join(d.labels))}'
+                        f'{txt}</td><td class="num">×{d.announcements}</td></tr>')
+        out.append('<h3 style="margin:18px 0 8px">Devices that announced themselves</h3><table><tr><th>Name</th><th>Address</th><th>What it is</th>'
+                   "<th>Offers</th><th>Seen</th></tr>" + "".join(rows) + "</table>")
+    out += [f'<p class="muted">{_e(b)}</p>' for b in s["background"]]
+    return "".join(out)
+
+
 def build_report(an: Analyzer, source: str) -> str:
     an.finish()
     risky = score_flows(an)
@@ -231,6 +266,7 @@ def build_report(an: Analyzer, source: str) -> str:
     summary = (f'<div class="kpis">{kpi_html}{alert_kpi}{risk_kpi}</div><div class="verdict">{_e(verdict)}</div>'
                + ("<ul>" + "".join(f"<li>{p}</li>" for p in points) + "</ul>" if points else ""))
     section("summary", "Executive summary", summary)
+    section("story", "In plain English", plain_english(an))
 
     rows = []
     for e in events[:400]:
@@ -371,7 +407,7 @@ def build_report(an: Analyzer, source: str) -> str:
             if not d["response"]:
                 q[d["id"]] = d
                 continue
-            ans = ", ".join(map(str, d["answers"][:4])) or d["rcode"]
+            ans = d.get("meaning") or ", ".join(map(str, d["answers"][:4])) or d["rcode"]
             lat = (d["ts"] - q[d["id"]]["ts"]) * 1000 if d["id"] in q else None
             dns_rows.append(f'<tr><td class="num mono">{d["ts"] - t0:.3f}</td><td class="mono">{_e(f.client[0])}</td>'
                             f'<td class="mono" style="word-break:break-all">{_e(d["qname"])}</td><td>{_e(d["qtype"])}</td>'

@@ -21,13 +21,13 @@ from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 
-from . import explain, hosts as host_profiles, timeline as TL, ui
+from . import explain, hosts as host_profiles, story, timeline as TL, ui
 from .analyzer import Analyzer
 from .filters import FilterError, compile_filter
 from .scoring import level_for, score_flows
 
-TABS = ("Overview", "Packets", "Conversations", "Hosts", "Alerts", "Timeline", "Hunt")
-SHORT = ("Home", "Pkts", "Convs", "Hosts", "Alerts", "Time", "Hunt")
+TABS = ("Overview", "Packets", "Conversations", "Hosts", "Alerts", "Timeline", "Hunt", "Activity")
+SHORT = ("Home", "Pkts", "Convs", "Hosts", "Alerts", "Time", "Hunt", "Activity")
 SORTS = ("time", "risk", "bytes")
 SELECTED = "reverse"
 
@@ -35,7 +35,7 @@ HELP = [
     ("Move", [("↑ ↓   k j", "one row"), ("PgUp PgDn   b space", "one page"), ("g   G", "top / bottom")]),
     ("Open", [("Enter   →   l", "open the selected row"), ("Esc   ←   h", "go back"),
               ("n   p", "next / previous item in a detail")]),
-    ("Views", [("1 … 7", "Home Packets Conversations Hosts Alerts Timeline Hunt"), ("Tab   Shift-Tab", "next / previous")]),
+    ("Views", [("1 … 8", "Home Packets Conversations Hosts Alerts Timeline Hunt Activity"), ("Tab   Shift-Tab", "next / previous")]),
     ("Find", [("/", "filter the list; packets take filters like  dns  or  tcp.port == 443"), ("c", "clear the filter")]),
     ("Act", [("f", "follow the conversation behind a packet, alert or finding"),
              ("s", "sort conversations by time, risk or bytes"), ("x", "hex dump on/off in a packet"),
@@ -89,6 +89,9 @@ class Explorer:
         self.alerts = sorted(an.alerts, key=lambda a: (a.ts, a.rule))
         self.events = TL.build(an)
         self.findings = list(an.findings or [])
+        self.nar = an.narrator
+        self.story = story.summarize(an)
+        self.activity = self.story["events"]
         self.tab = 0
         self.lists = {name: ListState() for name in TABS}
         self.sort = 0
@@ -115,7 +118,8 @@ class Explorer:
             if key == "bytes":
                 return sorted(self.flows, key=lambda f: -f.bytes)
             return self.flows
-        return {"Hosts": self.hosts, "Alerts": self.alerts, "Timeline": self.events, "Hunt": self.findings}[name]
+        return {"Hosts": self.hosts, "Alerts": self.alerts, "Timeline": self.events, "Hunt": self.findings,
+                "Activity": self.activity}[name]
 
     def _search_text(self, name: str, item) -> str:
         if name == "Conversations":
@@ -128,6 +132,8 @@ class Explorer:
             return f"{item.kind} {item.title} {item.detail} {item.src} {item.dst}"
         if name == "Hunt":
             return f"{item.kind} {item.client} {item.target} {item.summary}"
+        if name == "Activity":
+            return f"{item.kind} {item.category} {self.nar.describe(item)} {' '.join(map(str, item.items))}"
         return ""
 
     def _refilter(self, name: str) -> None:
@@ -181,7 +187,7 @@ class Explorer:
         if key == "?":
             self.show_help = True
             self.help_view.scroll = 0
-        elif key in "1234567" and len(key) == 1:
+        elif key in "12345678" and len(key) == 1:
             self._switch(int(key) - 1)
         elif key == "tab":
             self._switch((self.tab + 1) % len(TABS))
@@ -276,7 +282,7 @@ class Explorer:
 
     def _kind_for(self, tab: str) -> str:
         return {"Packets": "packet", "Conversations": "flow", "Hosts": "host", "Alerts": "alert",
-                "Timeline": "event", "Hunt": "finding"}[tab]
+                "Timeline": "event", "Hunt": "finding", "Activity": "story"}[tab]
 
     def _open(self, kind: str, item, index: int) -> None:
         if kind == "event":  # timeline events open the conversation they belong to
@@ -294,7 +300,7 @@ class Explorer:
     def _flow_of(self, item):
         flow_id = getattr(item, "flow_id", None) or getattr(item, "flow", None)
         if flow_id is None and getattr(item, "flows", None):
-            flow_id = item.flows[0]
+            flow_id = sorted(item.flows)[0]
         return self.an.tracker.by_id.get(flow_id) if isinstance(flow_id, int) else None
 
     def _follow(self, item) -> None:
@@ -340,6 +346,18 @@ class Explorer:
                 self._follow(view.item)
         elif key in ("enter", "right", "l") and view.kind == "alert":
             self._follow(view.item)
+        elif key in ("enter", "right", "l") and view.kind == "story":
+            pkt = self._packet(view.item.packets[0]) if view.item.packets else None
+            if pkt is None:
+                self.message = "That packet is no longer in memory"
+            else:
+                self.stack.append(View("packet", pkt, -1))
+
+    def _packet(self, number: int):
+        i = number - self.packets[0].number if self.packets else -1
+        if 0 <= i < len(self.packets) and self.packets[i].number == number:
+            return self.packets[i]
+        return next((p for p in self.packets if p.number == number), None)
 
     def _report(self) -> None:
         from .report import write_report
@@ -382,7 +400,7 @@ class Explorer:
 
     def _tabs(self, width: int) -> Text:
         counts = {"Packets": len(self.packets), "Conversations": len(self.flows), "Hosts": len(self.hosts),
-                  "Alerts": len(self.alerts), "Hunt": len(self.findings)}
+                  "Alerts": len(self.alerts), "Hunt": len(self.findings), "Activity": len(self.activity)}
         for names, with_counts, show_file in ((TABS, True, True), (TABS, True, False), (SHORT, True, False),
                                               (SHORT, False, False)):
             t = Text(no_wrap=True, overflow="ellipsis")
@@ -427,7 +445,8 @@ class Explorer:
         item = v.item
         return {"packet": lambda: f"packet #{item.number}", "flow": lambda: f"conversation {item.id}",
                 "host": lambda: f"host {item.addr}", "alert": lambda: f"alert {item.rule}",
-                "finding": lambda: f"{item.kind} {item.client}"}.get(v.kind, lambda: v.kind)()
+                "finding": lambda: f"{item.kind} {item.client}",
+                "story": lambda: f"{item.category} {item.src}"}.get(v.kind, lambda: v.kind)()
 
     def _footer(self, width: int) -> Text:
         if self.typing is not None:
@@ -443,15 +462,17 @@ class Explorer:
                 keys.append(("f", "follow conversation"))
             if kind == "packet":
                 keys.append(("x", "hex on/off"))
+            if kind == "story" and self.stack[-1].item.packets:
+                keys.append(("Enter", "first packet"))
             keys += [("?", "help"), ("q", "quit")]
         elif self.tab_name == "Overview":
-            keys = [("1-7", "views"), ("Enter", "see the alerts"), ("↑↓", "scroll"), ("r", "HTML report"),
+            keys = [("1-8", "views"), ("Enter", "see the alerts"), ("↑↓", "scroll"), ("r", "HTML report"),
                     ("?", "help"), ("q", "quit")]
         else:
             keys = [("↑↓", "move"), ("Enter", "open"), ("/", "filter"), ("Tab", "next view")]
             if self.tab_name == "Conversations":
                 keys.append(("s", f"sort: {SORTS[self.sort]}"))
-            if self.tab_name in ("Packets", "Alerts", "Timeline", "Hunt"):
+            if self.tab_name in ("Packets", "Alerts", "Timeline", "Hunt", "Activity"):
                 keys.append(("f", "follow"))
             keys += [("r", "report"), ("?", "help"), ("q", "quit")]
         t = Text(no_wrap=True, overflow="ellipsis")
@@ -552,6 +573,14 @@ class Explorer:
                 t.append(e.detail, style="grey62")
                 return t
             return header, row
+        if tab == "Activity":
+            header = f"{'Time':>9}  {'Kind':<10}What happened"
+
+            def row(e):
+                t = Text(f"{e.first_ts - t0:>9.2f}  ", style="grey62")
+                t.append_text(ui.story_line(self.nar, e, width - 11))
+                return t
+            return header, row
         header = f"{'Sev':<9}{'Score':>6}  {'Kind':<18}Summary"
 
         def row(x):
@@ -588,6 +617,9 @@ class Explorer:
                 title, why, action = explain.explain(a.rule)
                 parts.append(Text.assemble((f"{ui.SEV_ICON[a.severity]} {title}: ", ui.SEV_STYLE[a.severity]),
                                            (a.message + "\n", ""), ("  What to do: ", "grey62"), (action, "green3")))
+            mdns = item.layer("mdns")
+            if mdns is not None:
+                parts.insert(0, ui.mdns_panel(mdns.fields))
             if item.flow_id is not None:
                 parts.append(Text(f"Part of conversation {item.flow_id}: press f to follow it.", style="grey62"))
             return Group(*parts)
@@ -620,6 +652,8 @@ class Explorer:
             if related:
                 parts.append(ui.flows_table(related, limit=25, title="Conversations involved (f follows the first)"))
             return Group(*parts)
+        if kind == "story":
+            return ui.story_page(self.nar, item, self.t0)
         return Text(str(item))
 
     def _flow_page(self, flow, width: int):
@@ -645,7 +679,8 @@ class Explorer:
     def _overview(self, width: int):
         an = self.an
         sev = {s: sum(1 for a in self.alerts if a.severity == s) for s in ("high", "medium", "low")}
-        parts = [ui.summary_panel(an, self.source)]
+        parts = [Panel(Text(" ".join(self.story["headline"])), title="[bold]In plain English[/]", title_align="left",
+                       border_style="cyan", box=box.ROUNDED), ui.summary_panel(an, self.source)]
         if self.alerts or self.findings:
             verdict = Text("What stands out\n", style="bold")
             groups = explain.group(self.alerts)
@@ -669,7 +704,8 @@ class Explorer:
         tips = Table.grid(padding=(0, 2))
         tips.add_column(style="bold cyan", no_wrap=True)
         tips.add_column()
-        for k, v in (("5  or  Enter", "see every alert with what it means and what to do"),
+        for k, v in (("8", "everything that happened, as plain sentences with repeats grouped"),
+                     ("5  or  Enter", "see every alert with what it means and what to do"),
                      ("2", "browse packets; Enter opens one with its layers and hex dump"),
                      ("3", "conversations; Enter shows the ladder diagram and the reassembled data"),
                      ("4", "who is on the network: roles, open ports, DNS lookups"),

@@ -70,6 +70,21 @@ def cmd_stats(args) -> None:
     ui.print_stats(an, os.path.basename(args.file))
 
 
+def cmd_summary(args) -> None:
+    from . import story
+    an = _analyze(args.file, keep=False)
+    s = story.summarize(an)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(story.to_text(s))
+        con.print(f"[green3]Wrote the summary to [bold]{args.out}[/]")
+        return
+    if args.text:
+        sys.stdout.write(story.to_text(s))
+        return
+    con.print(ui.story_view(an, con.width, s))
+
+
 def cmd_flows(args) -> None:
     an = _analyze(args.file, keep=False)
     scoring.score_flows(an)
@@ -240,8 +255,10 @@ WELCOME = [
     ("Try it on demo traffic", "pktanalyzer demo", "a scan, ARP spoofing, a phishing site and more"),
     ("…or a hacked laptop", "pktanalyzer demo --c2", "beaconing and data leaving the network"),
     ("Open a capture file", "pktanalyzer capture.pcap", "browse it with the keyboard (? shows the keys)"),
+    ("Explain a capture simply", "pktanalyzer summary capture.pcap", "what happened, in plain English"),
     ("Watch your network live", "sudo pktanalyzer live", "full-screen dashboard"),
     ("Record traffic to a file", "sudo pktanalyzer capture -w out.pcap", "Ctrl-C to stop"),
+    ("Narrate live traffic", "sudo pktanalyzer capture --plain", "one readable line per new activity"),
     ("Make a shareable report", "pktanalyzer report capture.pcap", "one HTML file"),
     ("Compare two captures", "pktanalyzer diff before.pcap after.pcap", "what appeared or changed"),
     ("Every command", "pktanalyzer --help", ""),
@@ -305,8 +322,10 @@ def cmd_capture(args) -> None:
     an = Analyzer(verify_checksums=args.checksums, keep_packets=False)
     printer = ui.PacketPrinter(absolute_time=True)
     writer = PcapWriter(args.write) if args.write else None
-    con.print(f"[grey62]Capturing on [bold]{source}[/] · Ctrl-C to stop")
+    con.print(f"[grey62]Capturing on [bold]{source}[/] · Ctrl-C to stop"
+              + (" · one line per new kind of activity, repeats are counted" if args.plain else ""))
     shown = 0
+    told: set = set()
     try:
         for frame in frames:
             if frame is None:
@@ -314,6 +333,17 @@ def cmd_capture(args) -> None:
             if writer:
                 writer.write(frame.ts, frame.data, frame.orig_len)
             pkt = an.feed(frame)
+            if args.plain:
+                for ev in an.narrator.recent(5):
+                    # a new web connection is told once its TLS/HTTP request names the site
+                    if ev.key in told or not pred(pkt) or (ev.kind == "connect" and set(ev.items) <= {80, 443}):
+                        continue
+                    told.add(ev.key)
+                    shown += 1
+                    con.print(ui.story_line(an.narrator, ev, con.width, None, wrap=True))
+                if args.count and shown >= args.count:
+                    break
+                continue
             if pred(pkt):
                 shown += 1
                 if args.verbose:
@@ -330,6 +360,8 @@ def cmd_capture(args) -> None:
     con.print(Rule(style="grey35"))
     con.print(f"[grey62]{an.count} packets captured, {shown} shown, {len(an.alerts)} alerts"
               + (f", saved to [bold]{args.write}" if args.write else ""))
+    if an.count:
+        con.print(ui.story_view(an, con.width))
 
 
 def cmd_live(args) -> None:
@@ -367,6 +399,8 @@ def cmd_live(args) -> None:
                             quit_now = True
                         elif k == " ":
                             dash.paused = not dash.paused
+                        elif k == "s":
+                            dash.story = not dash.story
                     # a paused replay stops reading; a paused live capture keeps counting but freezes the view
                     while dash.paused and args.read and not quit_now:
                         live.update(dash.render())
@@ -375,6 +409,8 @@ def cmd_live(args) -> None:
                                 quit_now = True
                             elif k == " ":
                                 dash.paused = False
+                            elif k == "s":
+                                dash.story = not dash.story
                     if quit_now:
                         break
                     if not dash.paused:
@@ -382,17 +418,19 @@ def cmd_live(args) -> None:
                     last = now
             dash.paused = False
             live.update(dash.render())
-            if args.read and not quit_now:
+            if args.read and not quit_now and dash.keys:
                 # replay finished: keep the final picture up until the user quits
                 dash.finished = True
                 while True:
                     live.update(dash.render())
-                    keys = pressed(0.25) if dash.keys else (time.sleep(0.25) or [])
+                    keys = pressed(0.25)
                     if "q" in keys:
                         break
                     if "e" in keys:
                         explore_after = True
                         break
+                    if "s" in keys:
+                        dash.story = not dash.story
     except KeyboardInterrupt:
         pass
     finally:
@@ -403,6 +441,8 @@ def cmd_live(args) -> None:
         run(_analyze(args.read), args.read, con)
         return
     ui.print_stats(an, source)
+    if an.count:
+        con.print(ui.story_view(an, con.width))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -411,6 +451,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n  pktanalyzer demo                    explore demo traffic with the keyboard\n"
                "  pktanalyzer capture.pcap            explore a capture (same as: explore capture.pcap)\n"
+               "  pktanalyzer summary capture.pcap    what happened, in plain English\n"
                "  sudo pktanalyzer live               live dashboard\n"
                "  pktanalyzer report capture.pcap     HTML incident report\n"
                "  pktanalyzer COMMAND -h              help for one command")
@@ -440,6 +481,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("numbers", type=int, nargs="+", metavar="N")
     s.add_argument("--no-hex", action="store_true")
     s.set_defaults(func=cmd_show)
+
+    su = sub.add_parser("summary", help="what happened in plain English: who did what, what to worry about")
+    su.add_argument("file")
+    su.add_argument("--text", action="store_true", help="plain text without colours or boxes")
+    su.add_argument("-o", "--out", metavar="FILE", help="write the plain-text summary to a file")
+    su.set_defaults(func=cmd_summary)
 
     st = sub.add_parser("stats", help="summary: protocols, talkers, conversations, HTTP, DNS, alerts")
     st.add_argument("file")
@@ -533,6 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
         if name == "capture":
             c.add_argument("-c", "--count", type=int)
             c.add_argument("-v", "--verbose", action="store_true")
+            c.add_argument("-p", "--plain", action="store_true",
+                           help="print what is happening in plain English instead of raw packets")
         c.set_defaults(func=func)
 
     sa = sub.add_parser("sample", help="generate a demo pcap with normal traffic and attacks")

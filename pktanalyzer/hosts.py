@@ -155,7 +155,8 @@ class HostProfiler:
             d.last_ts = pkt.ts
             d.pkts_recv += 1
             d.bytes_recv += pkt.orig_len
-        if src != "0.0.0.0":
+        # mDNS/LLMNR always use TTL 255 (or 1) whatever the OS, so they would skew the OS guess
+        if src != "0.0.0.0" and not dst.startswith(("224.", "239.", "ff0")) and pkt.layer("mdns") is None:
             s.ttls[ip["ttl"]] += 1
         tcp = pkt.layer("tcp")
         # keep the first SYN with options: optionless SYNs are usually crafted by scanners

@@ -11,8 +11,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pktanalyzer import (craft, diff, dns, explain, filters, hosts, hunt, report, scoring, timeline,  # noqa: E402
-                         tls, x509)
+from pktanalyzer import (craft, diff, discovery, dns, explain, filters, hosts, hunt, report, scoring,  # noqa: E402
+                         story, timeline, tls, x509)
 from pktanalyzer.analyzer import Analyzer, info                    # noqa: E402
 from pktanalyzer.craft import ACK, FIN, PSH, RST, SYN               # noqa: E402
 from pktanalyzer.decoder import Decoder, inet_checksum              # noqa: E402
@@ -605,6 +605,134 @@ class TestHunt(unittest.TestCase):
         self.assertFalse(set(hunt.RULE_FOR.values()) - set(explain.RULES))
 
 
+class TestStory(unittest.TestCase):
+    """Plain-English summaries and the mDNS/SSDP translation behind them."""
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.pcap")
+            craft.write_sample(path)
+            cls.an = Analyzer()
+            for _ in cls.an.run(open_capture(path)):
+                pass
+        cls.summary = story.summarize(cls.an)
+
+    def test_txt_and_service_names(self):
+        txt = discovery.parse_txt('"acl=0" "model=AppleTV14,1" "features=0x4A7FDFD5,0x3C177FDE" "empty="')
+        self.assertEqual(txt, {"acl": "0", "model": "AppleTV14,1", "features": "0x4A7FDFD5,0x3C177FDE", "empty": ""})
+        self.assertEqual(discovery.split_service("Living Room._airplay._tcp.local"), ("Living Room", "_airplay"))
+        self.assertEqual(discovery.split_service("_googlecast._tcp.local"), ("", "_googlecast"))
+        self.assertIsNone(discovery.split_service("30.0.0.10.in-addr.arpa"))
+        self.assertEqual(discovery.clean_instance("F638D6DC9CF5@Living Room"), "Living Room")
+        self.assertEqual(discovery.model_name("AppleTV14,1"), "Apple TV 4K 3rd gen")
+        self.assertEqual(discovery.model_name("J255AP"), "Apple TV 4K 3rd gen")
+        self.assertEqual(discovery.model_name("iPhone15,2"), "iPhone")
+        self.assertEqual(discovery.model_name("MacBookPro18,3"), "MacBook Pro")
+        meanings = {k: m for k, _v, m in discovery.explain_txt({"pk": "ab", "model": "AppleTV14,1", "ci": "5"})}
+        self.assertIn("pair", meanings["pk"])
+        self.assertIn("Apple TV", meanings["model"])
+        self.assertIn("light", meanings["ci"])
+
+    def test_mdns_announcement_decoded(self):
+        tv = self.an.discovery.devices["10.0.0.30"]
+        self.assertEqual(tv.name, "Living Room")
+        self.assertEqual(tv.model_name, "Apple TV 4K 3rd gen")
+        self.assertEqual(tv.os, "tvOS 26.6")
+        self.assertEqual(tv.hostname, "Living-Room.local")
+        self.assertEqual(tv.services["_airplay"]["port"], 7000)
+        self.assertEqual(tv.announcements, 4)
+        self.assertIn("AirPlay", tv.labels)
+        nest = self.an.discovery.devices["10.0.0.52"]
+        self.assertEqual(nest.name, "Kitchen speaker")
+        self.assertEqual(nest.kind, "Google Nest Mini")
+        self.assertEqual(self.an.discovery.devices["10.0.0.60"].kind, "Samsung smart TV or streaming device")
+        self.assertEqual(self.an.discovery.searches["10.0.0.41"]["_airplay"], 4)
+
+    def test_packet_info_lines(self):
+        lines = [(p.src, info(p)) for p in self.an.packets if p.layer("mdns") or p.layer("udp") and
+                 1900 in (p.layer("udp")["sport"], p.layer("udp")["dport"])]
+        said = lambda src: " | ".join(text for s, text in lines if s == src)  # noqa: E731
+        self.assertIn("Living Room (Apple TV 4K 3rd gen) announces AirPlay", said("10.0.0.30"))
+        self.assertIn("mDNS: looking for AirPlay screens", said("10.0.0.41"))
+        self.assertIn("SSDP: searching for smart TVs", said("10.0.0.41"))
+        self.assertIn("Samsung", said("10.0.0.60"))
+        self.assertNotIn('"acl=0"', " ".join(text for _s, text in lines))
+
+    def test_repeats_are_grouped(self):
+        nar = self.an.narrator
+        tv = nar.events[("announce", "10.0.0.30")]
+        self.assertEqual(tv.count, 4)
+        self.assertEqual(len(tv.packets), 4)
+        self.assertIn("announced itself as an Apple TV 4K 3rd gen running tvOS 26.6", nar.describe(tv))
+        self.assertEqual(sum(1 for e in nar.events.values() if e.kind == "announce" and e.src == "10.0.0.30"), 1)
+        scan = nar.events[("connect", "10.0.0.66", "10.0.0.23")]
+        self.assertIn("tried", nar.describe(scan))
+        self.assertEqual(story.shown_count(scan), 0)
+        web = nar.events[("web", "10.0.0.23", "github.com")]
+        self.assertEqual(nar.describe(web, short=True), "Connected securely to github.com")
+        # the SYN to github is told as the web visit, not as a separate connection
+        gh = next(e for e in nar.events.values() if e.kind == "connect" and e.src == "10.0.0.23" and 443 in e.items)
+        self.assertNotIn(443, nar.ports(gh))
+        alert = next(e for e in nar.ordered() if e.kind == "alert")
+        self.assertEqual(alert.severity, "high")
+        self.assertEqual(nar.ordered()[0].category, "alert")
+
+    def test_summary(self):
+        s = self.summary
+        head = " ".join(s["headline"])
+        self.assertIn("156 packets", head)
+        self.assertIn("port scan from 10.0.0.66", head)
+        self.assertIn("Living Room", head)
+        self.assertTrue(any(c["title"] == "Port scan" for c in s["concerns"]))
+        titles = [d["title"] for d in s["devices"]]
+        self.assertIn("Living Room (10.0.0.30)", titles)
+        attacker = next(d for d in s["devices"] if d["addr"] == "10.0.0.66")
+        self.assertTrue(any("different services" in line for _c, line, _n in attacker["lines"]))
+        text = story.to_text(s)
+        for heading in ("WHAT HAPPENED", "WHAT TO LOOK AT", "WHO DID WHAT", "DEVICES THAT ANNOUNCED THEMSELVES"):
+            self.assertIn(heading, text)
+        self.assertIn("background chatter", text)
+
+    def test_mdns_ttl_does_not_skew_os_guess(self):
+        tv = self.an.hosts.hosts["10.0.0.30"]
+        self.assertNotIn(255, tv.ttls)
+
+    def test_ipv4_and_ipv6_announcements_are_one_device(self):
+        import socket
+        an = Analyzer()
+        v6 = "fe80::1"
+        recs = [("_airplay._tcp.local", 12, craft.dns_name("Den._airplay._tcp.local"), 4500),
+                ("Den._airplay._tcp.local", 16, craft.txt("model=AppleTV11,1"), 4500),
+                ("Den.local", 1, socket.inet_aton("10.0.0.9"), 120),
+                ("Den.local", 28, socket.inet_pton(socket.AF_INET6, v6), 120)]
+        msg = craft.mdns_message(recs)
+        f6 = craft.ethernet(MA, "33:33:00:00:00:fb", 0x86DD, craft.ipv6(v6, "ff02::fb", 17,
+                                                                       craft.udp(v6, "ff02::fb", 5353, 5353, msg)))
+        f4 = craft.ethernet(MA, "01:00:5e:00:00:fb", 0x0800, craft.ipv4("10.0.0.9", "224.0.0.251", 17,
+                                                                       craft.udp("10.0.0.9", "224.0.0.251", 5353, 5353, msg)))
+        for i, fr in enumerate((f6, f4, f6)):
+            an.feed(Frame(1.0 + i, fr, LINKTYPE_ETHERNET, len(fr)))
+        devices = an.discovery.ranked()
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0].addr, "10.0.0.9")
+        self.assertEqual(devices[0].announcements, 3)
+        self.assertEqual(devices[0].model_name, "Apple TV 4K 2nd gen")
+        self.assertEqual([e.count for e in an.narrator.events.values() if e.kind == "announce"], [3])
+
+    def test_ssdp(self):
+        s = discovery.parse_ssdp(b"M-SEARCH * HTTP/1.1\r\nST: roku:ecp\r\n\r\n")
+        self.assertEqual(s["kind"], "search")
+        self.assertEqual(discovery.ssdp_summary(s), "SSDP: searching for Roku players")
+        self.assertIsNone(discovery.parse_ssdp(b"hello"))
+
+    def test_empty(self):
+        an = Analyzer()
+        s = story.summarize(an)
+        self.assertEqual(s["headline"], ["No packets were captured."])
+        self.assertIn("No packets", story.to_text(s))
+
+
 class TestExplorer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -630,7 +758,26 @@ class TestExplorer(unittest.TestCase):
         for k in ks:
             self.assertTrue(self.ex.handle_key(k), k)
 
+    def test_activity_tab(self):
+        self.assertIn("In plain English", self.screen())
+        self.keys("8")
+        self.assertEqual(self.ex.tab_name, "Activity")
+        screen = self.screen(130, 40)
+        self.assertIn("What happened", screen)
+        self.assertIn("Warning", screen)
+        self.keys("/", *"living", "enter")
+        self.assertEqual(len(self.ex.state.items), 1)
+        self.keys("enter")
+        page = self.screen(130, 60)
+        self.assertIn("Apple TV 4K 3rd gen", page)
+        self.assertIn("public key used to pair securely", page)
+        self.keys("enter")  # the first packet of the group, with its plain-English reading
+        self.assertEqual(self.ex.stack[-1].kind, "packet")
+        self.assertIn("In plain English", self.screen(130, 60))
+
     def test_navigation_and_details(self):
+        self.assertIn("In plain English", self.screen())
+        self.keys("pgdn")
         self.assertIn("Where to go next", self.screen())
         self.keys("2", "j", "j", "j", "enter")
         self.assertEqual(self.ex.stack[-1].item.number, 4)
@@ -764,6 +911,8 @@ class TestCLI(unittest.TestCase):
                          ["diff", os.path.join(d, "b.pcap"), path, "--json", os.path.join(d, "d.json")],
                          ["sample", "--c2", os.path.join(d, "c2.pcap")], ["hunt", os.path.join(d, "c2.pcap")],
                          ["hunt", path], [path], ["explore", path], ["demo"], ["demo", "--c2"],
+                         ["summary", path], ["summary", path, "--text"], ["summary", path, "-o", os.path.join(d, "s.txt")],
+                         ["capture", "-r", path, "--plain"], ["live", "-r", path, "--speed", "0"],
                          ["report", path, "-o", os.path.join(d, "r.html")],
                          ["export", path, "-o", os.path.join(d, "ex")]):
                 self.assertEqual(cli.main(args), 0, args)
@@ -774,6 +923,10 @@ class TestCLI(unittest.TestCase):
             self.assertIn("Port scan", out)
             self.assertIn("pktanalyzer demo", out)    # the welcome screen
             self.assertIn("interactive terminal", out)  # explore falls back to a summary when piped
+            self.assertIn("Who did what", out)
+            self.assertIn("Living Room (10.0.0.30) announced itself", out)
+            with open(os.path.join(d, "s.txt")) as fh:
+                self.assertIn("WHAT HAPPENED", fh.read())
 
 
 if __name__ == "__main__":

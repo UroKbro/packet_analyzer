@@ -12,6 +12,8 @@ Every header is parsed by hand with `struct`. There's no scapy and no libpcap. T
 pip3 install -r requirements.txt
 python3 -m pktanalyzer demo          # make demo traffic and open it in the explorer
 python3 -m pktanalyzer capture.pcap  # open your own capture the same way
+python3 -m pktanalyzer summary capture.pcap  # what happened, in plain English
+sudo python3 -m pktanalyzer capture --plain  # narrate live traffic: one readable line per new activity
 python3 -m pktanalyzer               # a short menu of the most useful commands
 ```
 
@@ -19,7 +21,7 @@ The explorer is driven entirely from the keyboard, and the bottom line always sh
 
 | Key | What it does |
 |---|---|
-| `1` … `7` | Overview, Packets, Conversations, Hosts, Alerts, Timeline, Hunt (`Tab` / `Shift-Tab` cycle) |
+| `1` … `8` | Overview, Packets, Conversations, Hosts, Alerts, Timeline, Hunt, Activity (`Tab` / `Shift-Tab` cycle) |
 | `↑` `↓` (or `j` `k`), `PgUp` `PgDn`, `g` `G` | move, page, jump to top/bottom |
 | `Enter` | open the selected packet, conversation, host, alert or finding |
 | `Esc` (or `←`) | go back |
@@ -33,7 +35,28 @@ The explorer is driven entirely from the keyboard, and the bottom line always sh
 | `?` | all shortcuts |
 | `q` | quit |
 
-The live dashboard takes keys too: `space` pauses, `q` quits, and when a replay (`live -r file`) finishes, `e` opens the capture in the explorer.
+The live dashboard takes keys too: `space` pauses, `s` swaps the raw packet list for a plain-English "What's happening" feed, `q` quits, and when a replay (`live -r file`) finishes, `e` opens the capture in the explorer.
+
+### Reading it in plain English
+
+Raw packets are hard to read, and a home network is full of repeats: an Apple TV announcing itself every few seconds looks like this in most tools:
+
+```text
+"acl=0" "btaddr=69:27:59:6E:3E:44" "deviceid=F6:38:D6:DC:9C:F5" "features=0x4A7FDFD5,0x3C177FDE" "model=AppleTV14,1" ...
+```
+
+pktanalyzer turns that into one line with a count, and does the same for everything else it sees:
+
+```text
+Nearby    Living Room (10.0.0.30) announced itself as an Apple TV 4K 3rd gen running tvOS 26.6,
+          offering AirPlay, Apple device link, AirPlay audio  ×4
+Web       10.0.0.23 connected securely to github.com
+Warning   Port scan from 10.0.0.66: 15 ports probed on 10.0.0.23 in 10s
+```
+
+`summary FILE` prints the whole story (what happened, what to look at, who did what, which devices announced themselves), and the same summary opens the explorer, `stats`, the live dashboard's exit screen and the HTML report. In the explorer, `8` lists every grouped activity; `Enter` on a device announcement shows each Bonjour/mDNS record with what its keys mean (`model`, `deviceid`, `pk`, `features`, `acl`, ...).
+
+![summary](docs/summary.svg)
 
 ![live dashboard](docs/dashboard.svg)
 
@@ -41,6 +64,7 @@ The live dashboard takes keys too: `space` pauses, `q` quits, and when a replay 
 
 | Area | What it does |
 |---|---|
+| **Plain-English summary** | `summary FILE`, `capture --plain`, the dashboard's `s` view and the explorer's Activity tab group repeated packets into readable sentences ("X looked up 12 names", "Y connected securely to github.com ×4") and translate local discovery chatter: Bonjour/mDNS service types (AirPlay, Google Cast, HomeKit, printers, ...), device models (`AppleTV14,1` → Apple TV 4K 3rd gen), OS versions and every common TXT key, plus SSDP/UPnP announcements and searches |
 | **Explorer** | `explore FILE` (or just `pktanalyzer FILE`) opens a full-screen, keyboard-driven browser over packets, conversations, hosts, alerts, the timeline and hunt findings, with filters, drill-down from any alert to its conversation, and a report key |
 | **Capture** | Live capture with raw sockets: `AF_PACKET` on Linux, the BPF device (`/dev/bpf*`) on macOS. It also reads pcap (µs/ns, either byte order) and pcapng, and writes pcap. |
 | **Link / network** | Ethernet II, 802.1Q/QinQ VLANs, Linux cooked capture, BSD loopback, ARP, IPv4 (options, checksum validation), IPv6 (extension-header chain walking) |
@@ -147,6 +171,8 @@ pktanalyzer/
 ├── scoring.py    0-100 risk score per conversation, built from explainable evidence
 ├── timeline.py   time-ordered event view (handshakes, DNS, HTTP, TLS, resets, alerts)
 ├── hosts.py      per-host profiles: names, MAC, OS guess, roles, services, lookups, alerts
+├── discovery.py  mDNS/Bonjour and SSDP/UPnP: devices, models, services and TXT keys in plain words
+├── story.py      groups packets into plain-English events and writes the capture's summary
 ├── hunt.py       beaconing and exfiltration detection across the whole capture
 ├── explorer.py   interactive keyboard-driven explorer (state machine + terminal key reader)
 ├── diff.py       compares two captures (flows, DNS, TLS, alerts, hosts, ports, bandwidth)

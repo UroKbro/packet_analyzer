@@ -4,12 +4,13 @@ from __future__ import annotations
 from collections import Counter, defaultdict, deque
 from typing import Iterable, Iterator
 
-from . import dns, http, tls
+from . import discovery, dns, http, tls
 from .anomalies import AnomalyDetector
 from .decoder import Decoder
 from .flows import FlowTracker
 from .hosts import HostProfiler
 from .packet import Packet
+from .story import Narrator
 from .pcap import Frame
 
 
@@ -23,6 +24,8 @@ class Analyzer:
         self.tracker.listeners.append(
             lambda flow, kind, data: self.detector.flow_event(self.tracker.current, flow, kind, data))
         self.hosts = HostProfiler()
+        self.discovery = discovery.Discovery()   # devices announcing themselves (mDNS/SSDP)
+        self.narrator = Narrator(self)           # grouped plain-English events
         self.keep_packets = keep_packets
         # keep every packet for offline analysis, or a ring buffer for live views
         self.packets: list[Packet] | deque = deque(maxlen=history) if history else []
@@ -43,6 +46,7 @@ class Analyzer:
         flow = self.tracker.process(pkt)
         self.detector.process(pkt, flow)
         self.hosts.process(pkt)
+        self.narrator.process(pkt, flow, self.discovery.process(pkt))
         self._stats(pkt)
         if self.keep_packets:
             self.packets.append(pkt)
@@ -91,8 +95,12 @@ def info(pkt: Packet) -> str:
     t = pkt.layer("tls")
     tcp = pkt.layer("tcp")
     udp = pkt.layer("udp")
+    ssdp = pkt.layer("udp") is not None and 1900 in (pkt.layer("udp")["sport"], pkt.layer("udp")["dport"]) \
+        and discovery.parse_ssdp(pkt.payload)
     if d is not None:
-        parts.append(dns.summary(d.fields))
+        parts.append(discovery.mdns_summary(d.fields) if d.name == "mdns" else dns.summary(d.fields))
+    elif ssdp:
+        parts.append(discovery.ssdp_summary(ssdp))
     elif h is not None:
         parts.append(http.summary(h.fields))
     elif t is not None:

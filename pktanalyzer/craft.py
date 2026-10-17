@@ -100,6 +100,24 @@ def dns_response(ident: int, name: str, answers: list[tuple[int, bytes]], qtype:
     return msg
 
 
+def mdns_message(records: list[tuple], questions: tuple = (), response: bool = True) -> bytes:
+    """An mDNS message. ``records`` are (name, rtype, rdata, ttl); ``questions`` are (name, qtype)."""
+    msg = struct.pack("!HHHHHH", 0, 0x8400 if response else 0, len(questions), len(records), 0, 0)
+    for name, qtype in questions:
+        msg += dns_name(name) + struct.pack("!HH", qtype, 1)
+    for name, rtype, rdata, ttl in records:
+        msg += dns_name(name) + struct.pack("!HHIH", rtype, 0x8001 if rtype != 12 else 1, ttl, len(rdata)) + rdata
+    return msg
+
+
+def txt(*pairs: str) -> bytes:
+    return b"".join(bytes([len(p)]) + p.encode() for p in pairs)
+
+
+def srv(port: int, target: str) -> bytes:
+    return struct.pack("!HHH", 0, 0, port) + dns_name(target)
+
+
 def dhcp(op: int, msg_type: int, client_mac: str, xid: int = 0x1234, your_ip: str = "0.0.0.0",
          hostname: str | None = None) -> bytes:
     """BOOTP header + magic cookie + options (53 message type, 12 hostname)."""
@@ -352,6 +370,8 @@ def write_sample(path: str, seed: int = 7, baseline: bool = False) -> int:
                                                  17, udp("fe80::1c22:fbff:fe12:3456", "fe80::1", 53999, 53,
                                                          dns_query(0x3c4d, "ipv6.google.com", 28)))), 0.05)
 
+    _home_chatter(sc)
+
     if baseline:
         _tls_sessions(sc, me, me_mac, gw, gw_mac, [(0x5e6f, "api.example.com", "198.51.100.20", 51720)])
         return sc.write(path)
@@ -410,6 +430,50 @@ def write_sample(path: str, seed: int = 7, baseline: bool = False) -> int:
     _tls_sessions(sc, me, me_mac, gw, gw_mac, [(0x5e6f, "api.example.com", "198.51.100.20", 51720),
                                                (0x6f70, "login.paypa1-secure.com", "203.0.113.50", 51730)])
     return sc.write(path)
+
+
+def _home_chatter(sc: Scenario) -> None:
+    """The background noise of a home network: an Apple TV, a Nest speaker and a smart TV announcing
+    themselves, and a phone looking for something to cast to."""
+    tv, tv_mac = "10.0.0.30", "f6:38:d6:dc:9c:f5"
+    phone, phone_mac = "10.0.0.41", "7a:11:22:33:44:41"
+    nest, nest_mac = "10.0.0.52", "d4:f5:47:00:00:52"
+    samsung, samsung_mac = "10.0.0.60", "8c:79:f5:00:00:60"
+    mcast, mcast_mac = "224.0.0.251", "01:00:5e:00:00:fb"
+
+    def mdns(src_mac, src, payload, dt):
+        sc.add(ethernet(src_mac, mcast_mac, 0x0800, ipv4(src, mcast, 17, udp(src, mcast, 5353, 5353, payload),
+                                                         ttl=255)), dt)
+
+    airplay = txt("acl=0", "btaddr=69:27:59:6E:3E:44", "deviceid=F6:38:D6:DC:9C:F5", "features=0x4A7FDFD5,0x3C177FDE",
+                  "flags=0x18644", "gid=A173B841-A9BB-46A8-AE1C-7D2393FC57F0", "igl=1", "model=AppleTV14,1",
+                  "protovers=1.1", "pk=233d1a998dfb9bff0145cf9119768f4d6d35436f64a8d3e1ec0c2865ea7c8fe1",
+                  "srcvers=960.13.1", "osvers=26.6", "vv=1")
+    tv_records = [("_airplay._tcp.local", 12, dns_name("Living Room._airplay._tcp.local"), 4500),
+                  ("Living Room._airplay._tcp.local", 33, srv(7000, "Living-Room.local"), 120),
+                  ("Living Room._airplay._tcp.local", 16, airplay, 4500),
+                  ("_companion-link._tcp.local", 12, dns_name("Living Room._companion-link._tcp.local"), 4500),
+                  ("Living Room._companion-link._tcp.local", 16, txt("rpMd=AppleTV14,1", "rpVr=665.3", "rpFl=0x36782"),
+                   4500),
+                  ("_raop._tcp.local", 12, dns_name("F638D6DCF9C5@Living Room._raop._tcp.local"), 4500),
+                  ("Living-Room.local", 1, socket.inet_aton(tv), 120)]
+    phone_q = mdns_message([], questions=(("_airplay._tcp.local", 12), ("_googlecast._tcp.local", 12),
+                                          ("_companion-link._tcp.local", 12)), response=False)
+    nest_records = [("_googlecast._tcp.local", 12, dns_name("Google-Nest-Mini-5f2e._googlecast._tcp.local"), 120),
+                    ("Google-Nest-Mini-5f2e._googlecast._tcp.local", 16,
+                     txt("id=5f2e8c", "md=Google Nest Mini", "fn=Kitchen speaker", "ve=05", "st=0"), 4500),
+                    ("Google-Nest-Mini-5f2e._googlecast._tcp.local", 33, srv(8009, "5f2e8c.local"), 120)]
+    for i in range(4):
+        mdns(phone_mac, phone, phone_q, 0.3)
+        mdns(tv_mac, tv, mdns_message(tv_records), 0.01)
+        mdns(nest_mac, nest, mdns_message(nest_records), 0.02)
+    sc.add(ethernet(phone_mac, "01:00:5e:7f:ff:fa", 0x0800, ipv4(phone, "239.255.255.250", 17, udp(
+        phone, "239.255.255.250", 50123, 1900, b"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+        b"MAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:dial-multiscreen-org:service:dial:1\r\n\r\n"))), 0.05)
+    sc.add(ethernet(samsung_mac, "01:00:5e:7f:ff:fa", 0x0800, ipv4(samsung, "239.255.255.250", 17, udp(
+        samsung, "239.255.255.250", 1900, 1900, b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+        b"NT: urn:dial-multiscreen-org:service:dial:1\r\nNTS: ssdp:alive\r\n"
+        b"LOCATION: http://10.0.0.60:7678/nservice/\r\nSERVER: SHP, UPnP/1.0, Samsung UPnP SDK/1.0\r\n\r\n"))), 0.05)
 
 
 def _tls_sessions(sc: Scenario, me: str, me_mac: str, gw: str, gw_mac: str, sites: list) -> None:
