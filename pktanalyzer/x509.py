@@ -10,6 +10,8 @@ from __future__ import annotations
 import calendar
 import hashlib
 
+from .packet import printable
+
 OID_NAMES = {
     "2.5.4.3": "CN", "2.5.4.6": "C", "2.5.4.7": "L", "2.5.4.8": "ST", "2.5.4.10": "O", "2.5.4.11": "OU",
     "1.2.840.113549.1.9.1": "emailAddress",
@@ -73,8 +75,8 @@ def oid(b: bytes) -> str:
 
 def _string(tag: int, raw: bytes) -> str:
     if tag == 0x1E:  # BMPString
-        return raw.decode("utf-16-be", "replace")
-    return raw.decode("utf-8", "replace")
+        return printable(raw.decode("utf-16-be", "replace"))
+    return printable(raw.decode("utf-8", "replace"))
 
 
 def parse_name(b: bytes, start: int, end: int) -> tuple[dict, str]:
@@ -162,7 +164,7 @@ def parse_certificate(der: bytes) -> dict:
                 _, ss, se = tlv(der, value[1])
                 for gtag, gs, ge in children(der, ss, se):
                     if gtag == 0x82:
-                        sans.append(der[gs:ge].decode("ascii", "replace"))
+                        sans.append(printable(der[gs:ge].decode("ascii", "replace")))
                     elif gtag == 0x87:
                         raw = der[gs:ge]
                         sans.append(".".join(map(str, raw)) if len(raw) == 4 else raw.hex())

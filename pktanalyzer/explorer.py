@@ -18,13 +18,13 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.segment import Segment
-from rich.table import Table
 from rich.text import Text
 
 from . import explain, hosts as host_profiles, story, timeline as TL, ui
 from .analyzer import Analyzer
 from .filters import FilterError, compile_filter
 from .scoring import level_for, score_flows
+from .ui import Table  # renders captured strings literally (no rich markup)
 
 TABS = ("Overview", "Packets", "Conversations", "Hosts", "Alerts", "Timeline", "Hunt", "Activity")
 SHORT = ("Home", "Pkts", "Convs", "Hosts", "Alerts", "Time", "Hunt", "Activity")

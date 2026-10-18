@@ -1,7 +1,19 @@
 """The decoded-packet model shared by every layer of the analyzer."""
 from __future__ import annotations
 
+import re
 from typing import Any
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def printable(s: str, keep: str = "") -> str:
+    """Escape control characters in text read off the wire (``\\x1b`` instead of a raw ESC).
+
+    Names, headers and TXT records come from whoever sent the packet; printed raw, an ESC byte
+    becomes a terminal escape sequence that can clear the screen, retitle the window or fake output.
+    """
+    return _CONTROL.sub(lambda m: m.group() if m.group() in keep else f"\\x{ord(m.group()):02x}", s)
 
 
 class Layer:

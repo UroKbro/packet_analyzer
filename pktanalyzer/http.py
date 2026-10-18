@@ -6,6 +6,8 @@ Content-Length or chunked transfer encoding, the same way a real client does.
 """
 from __future__ import annotations
 
+from .packet import printable
+
 METHODS = (b"GET", b"POST", b"PUT", b"DELETE", b"HEAD", b"OPTIONS", b"PATCH", b"CONNECT", b"TRACE")
 
 
@@ -18,7 +20,7 @@ def looks_like_http(data: bytes) -> bool:
 
 def _parse_header_block(block: bytes) -> dict | None:
     lines = block.split(b"\r\n")
-    first = lines[0].decode("latin-1")
+    first = printable(lines[0].decode("latin-1"))
     parts = first.split(" ", 2)
     msg: dict = {}
     if first.startswith("HTTP/"):
@@ -34,8 +36,8 @@ def _parse_header_block(block: bytes) -> dict | None:
     for line in lines[1:]:
         if b":" in line:
             k, v = line.split(b":", 1)
-            key = k.decode("latin-1").strip().lower()
-            val = v.decode("latin-1").strip()
+            key = printable(k.decode("latin-1").strip().lower())
+            val = printable(v.decode("latin-1").strip())
             headers[key] = f"{headers[key]}, {val}" if key in headers else val
     msg["headers"] = headers
     for name, key in (("host", "host"), ("user-agent", "user_agent"), ("content-type", "content_type"),

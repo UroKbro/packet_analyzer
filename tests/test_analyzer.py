@@ -661,7 +661,7 @@ class TestStory(unittest.TestCase):
 
     def test_repeats_are_grouped(self):
         nar = self.an.narrator
-        tv = nar.events[("announce", "10.0.0.30")]
+        tv = next(e for e in nar.events.values() if e.kind == "announce" and e.src == "10.0.0.30")
         self.assertEqual(tv.count, 4)
         self.assertEqual(len(tv.packets), 4)
         self.assertIn("announced itself as an Apple TV 4K 3rd gen running tvOS 26.6", nar.describe(tv))
@@ -719,6 +719,70 @@ class TestStory(unittest.TestCase):
         self.assertEqual(devices[0].announcements, 3)
         self.assertEqual(devices[0].model_name, "Apple TV 4K 2nd gen")
         self.assertEqual([e.count for e in an.narrator.events.values() if e.kind == "announce"], [3])
+
+    def test_spoofed_announcement_cannot_rename_another_device(self):
+        an = Analyzer()
+        for path_frames in (self._mdns("02:00:00:00:00:30", "10.0.0.30", "Living Room"),
+                            self._mdns("de:ad:be:ef:00:01", "10.0.0.30", "Bank Login")):  # same IP, other MAC
+            an.feed(Frame(1.0, path_frames, LINKTYPE_ETHERNET, len(path_frames)))
+        self.assertEqual(an.discovery.devices["10.0.0.30"].name, "Living Room")
+        self.assertEqual(len(an.discovery.ranked()), 2)
+        lines = sorted(an.narrator.describe(e) for e in an.narrator.events.values() if e.kind == "announce")
+        self.assertTrue(lines[0].startswith("Bank Login (10.0.0.30)"), lines)  # told as itself, not as the TV
+        self.assertTrue(lines[1].startswith("Living Room (10.0.0.30)"), lines)
+
+    @staticmethod
+    def _mdns(mac, ip, name, txt=("model=AppleTV14,1",)):
+        msg = craft.mdns_message([("_airplay._tcp.local", 12, craft.dns_name(f"{name}._airplay._tcp.local"), 4500),
+                                  (f"{name}._airplay._tcp.local", 16, craft.txt(*txt), 4500)])
+        return craft.ethernet(mac, "01:00:5e:00:00:fb", 0x0800, craft.ipv4(ip, "224.0.0.251", 17,
+                              craft.udp(ip, "224.0.0.251", 5353, 5353, msg)))
+
+    def test_floods_are_bounded_and_new_activity_still_told(self):
+        an = Analyzer(keep_packets=False)
+        n = story.MAX_EVENTS + 500
+        for i in range(n):  # spoofed ARP requests and fake devices, each from a new address and MAC
+            mac = f"02:00:00:{i >> 16 & 255:02x}:{i >> 8 & 255:02x}:{i & 255:02x}"
+            ip = f"10.{i >> 16 & 255}.{i >> 8 & 255}.{i & 255}"
+            for fr in (craft.ethernet(mac, "ff:ff:ff:ff:ff:ff", 0x0806, craft.arp(1, mac, ip, "00:00:00:00:00:00", A)),
+                       self._mdns(mac, ip, f"junk{i}")):
+                an.feed(Frame(1.0 + i * 1e-3, fr, LINKTYPE_ETHERNET, len(fr)))
+        self.assertLessEqual(len(an.narrator.events), story.MAX_EVENTS)
+        self.assertLessEqual(len(an.discovery.by_mac), discovery.MAX_DEVICES)
+        hello = eth_tcp(A, B, 50000, 443, 1, 0, PSH | ACK, craft.tls_client_hello("example.org"))
+        an.feed(Frame(99.0, hello, LINKTYPE_ETHERNET, len(hello)))
+        self.assertIn(("web", A, "example.org"), an.narrator.events)
+        self.assertTrue(any("example.org" in an.narrator.describe(e) for e in an.narrator.recent(3)))
+
+    def test_hostile_strings_are_shown_literally(self):
+        """Names off the wire may carry terminal escapes and rich markup; neither may reach the screen."""
+        from rich.console import Console
+        from pktanalyzer import ui
+        from pktanalyzer.packet import printable
+        self.assertEqual(printable("a\x1b[2Jb\x9b\tc", keep="\t"), "a\\x1b[2Jb\\x9b\tc")
+        evil = "Evil[/x]\x1b]0;pwned\x07[bold]"
+        an = Analyzer()
+        frames = [self._mdns("02:00:00:00:00:66", "10.0.0.66", evil, txt=(f"model={evil}", f"osvers={evil}")),
+                  craft.ethernet(MA, MB, 0x0800, craft.ipv4(A, B, 17, craft.udp(A, B, 5555, 53, craft.dns_query(
+                      7, "x[/y]\x1b[2J.example"))))]
+        get = eth_tcp(A, B, 50001, 80, 1, 0, PSH | ACK, b"GET /a?f[name]=1 HTTP/1.1\r\nHost: h[/z]\r\n"
+                      b"User-Agent: \x1b[31mred\r\n\r\n")
+        for i, fr in enumerate(frames + [get]):
+            an.feed(Frame(1.0 + i, fr, LINKTYPE_ETHERNET, len(fr)))
+        con = Console(file=io.StringIO(), width=140, color_system=None, force_terminal=False)
+        with con.capture() as cap:
+            con.print(ui.story_view(an, 140))
+            ui.print_stats(an, "evil", con)
+            for p in an.packets:
+                con.print(ui.packet_detail(p))
+            for ev in an.narrator.events.values():
+                con.print(ui.story_page(an.narrator, ev, an.first_ts))
+            con.print(ui.http_table(an.flows))
+        out = cap.get()
+        self.assertNotIn("\x1b", out)
+        self.assertIn("Evil[/x]\\x1b]0;pwned\\x07[bold]", out)
+        self.assertIn("/a?f[name]=1", out)
+        self.assertIn("\\x1b[31mred", out)
 
     def test_ssdp(self):
         s = discovery.parse_ssdp(b"M-SEARCH * HTTP/1.1\r\nST: roku:ecp\r\n\r\n")

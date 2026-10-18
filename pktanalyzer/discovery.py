@@ -11,6 +11,8 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
+from .packet import printable
+
 # service type -> (short label, what offering it means, what searching for it means)
 SERVICES = {
     "_airplay": ("AirPlay", "can receive AirPlay video and screen mirroring", "AirPlay screens (Apple TVs, smart TVs)"),
@@ -189,19 +191,33 @@ def search_meaning(svc: str) -> str:
     return SERVICES[svc][2] if svc in SERVICES else f"'{svc.lstrip('_')}' services"
 
 
+# Everything here is filled from packets anyone on the LAN can forge, so every collection is capped.
+MAX_DEVICES = 512
+MAX_PER_DEVICE = 32     # names, services, TXT keys, addresses, UPnP targets, searched-for services
+
+
+def _room(container, key) -> bool:
+    """True if ``key`` is already in ``container`` or there is space to add it."""
+    return key in container or len(container) < MAX_PER_DEVICE
+
+
 @dataclass
 class Device:
-    """One machine that announced itself over mDNS or SSDP, keyed by the address it announced from."""
-    addr: str
+    """One machine that announced itself over mDNS or SSDP.
+
+    Identified by the MAC address its announcements came from (mDNS and SSDP never cross a router), so
+    its IPv4 and IPv6 announcements are one device. Addresses inside the records are not trusted for
+    identity: any host can claim any address in an A record.
+    """
+    addr: str          # the address it is shown under: its IPv4 one when it has one
     first_ts: float
     last_ts: float
     names: Counter = field(default_factory=Counter)
     hostname: str = ""
     model: str = ""
     services: dict = field(default_factory=dict)   # "_airplay" -> {"port": 7000, "txt": {...}}
-    addrs: set = field(default_factory=set)         # other addresses it announced for itself
+    addrs: set = field(default_factory=set)         # every address it announced from
     announcements: int = 0
-    goodbyes: int = 0
     server: str = ""                                # SSDP SERVER header
     upnp: set = field(default_factory=set)          # SSDP NT values
 
@@ -264,12 +280,7 @@ class Device:
             return f"{name} ({kind})"
         return name or kind
 
-    def to_dict(self) -> dict:
-        return dict(addr=self.addr, name=self.name, hostname=self.hostname, model=self.model,
-                    model_name=self.model_name, kind=self.kind, os=self.os, services=self.labels,
-                    addresses=sorted(self.addrs), announcements=self.announcements, server=self.server,
-                    first_ts=self.first_ts, last_ts=self.last_ts,
-                    txt={service_label(k): v["txt"] for k, v in self.services.items() if v["txt"]})
+_last: list = [None, None]   # the analyzer reads each mDNS message several times in a row; parse it once
 
 
 def interpret_mdns(msg: dict) -> dict:
@@ -278,8 +289,11 @@ def interpret_mdns(msg: dict) -> dict:
     Returns ``dict(response, instances={svc: name}, services={svc: None} (ordered), hostnames=set, addrs=set, txt={svc: {...}},
     ports={svc: port}, asks=[svc], goodbye)``.
     """
+    if _last[0] is msg:
+        return _last[1]
     out = dict(response=msg.get("response", False), instances={}, services={}, hostnames=set(), addrs=set(),
                txt={}, ports={}, asks=[], goodbye=False, model="")
+    _last[:] = msg, out
     records = msg.get("answers", []) + msg.get("authority", []) + msg.get("additional", [])
     for q in msg.get("questions", []):
         sp = split_service(q["name"])
@@ -344,11 +358,8 @@ def mdns_summary(msg: dict) -> str:
 
 
 def parse_ssdp(payload: bytes) -> dict | None:
-    try:
-        text = payload.decode("utf-8", "replace")
-    except Exception:  # pragma: no cover - decode with replace never raises
-        return None
-    lines = text.split("\r\n") if "\r\n" in text else text.split("\n")
+    text = payload[:4096].decode("utf-8", "replace")
+    lines = [printable(ln) for ln in (text.split("\r\n") if "\r\n" in text else text.split("\n"))]
     first = lines[0].strip()
     if not (first.startswith(("M-SEARCH", "NOTIFY")) or first.startswith("HTTP/1.1 200")):
         return None
@@ -359,8 +370,7 @@ def parse_ssdp(payload: bytes) -> dict | None:
             headers[k.strip().lower()] = v.strip()
     kind = "search" if first.startswith("M-SEARCH") else "notify" if first.startswith("NOTIFY") else "reply"
     target = headers.get("st") or headers.get("nt") or ""
-    return dict(kind=kind, target=target, server=headers.get("server", ""), location=headers.get("location", ""),
-                byebye=headers.get("nts", "") == "ssdp:byebye")
+    return dict(kind=kind, target=target, server=headers.get("server", ""), byebye=headers.get("nts", "") == "ssdp:byebye")
 
 
 def ssdp_target(target: str) -> str:
@@ -388,100 +398,94 @@ class Discovery:
     """Collects the devices that announced themselves and what everyone searched for."""
 
     def __init__(self):
-        self.devices: dict[str, Device] = {}
-        self.searches: dict[str, Counter] = {}   # address -> Counter of service types / SSDP targets looked for
-        self.packets = 0
+        self.devices: dict[str, Device] = {}     # every address a device announced from -> the device
+        self.by_mac: dict[str, Device] = {}
+        self.searches: dict[str, Counter] = {}   # address -> service types / SSDP targets it looked for
 
-    def _device(self, addr: str, ts: float) -> Device:
-        d = self.devices.get(addr)
+    def _device(self, pkt) -> Device | None:
+        eth = pkt.layer("ethernet")
+        mac = eth["src"] if eth is not None else None
+        # with a MAC, the MAC decides: someone else sending from this device's IP is not this device
+        d = self.by_mac.get(mac) if mac else self.devices.get(pkt.src)
         if d is None:
-            d = self.devices[addr] = Device(addr, ts, ts)
-        d.last_ts = ts
+            if len(self.by_mac) >= MAX_DEVICES or len(self.devices) >= MAX_DEVICES * 4:
+                return None
+            d = Device(pkt.src, pkt.ts, pkt.ts)
+            if mac:
+                self.by_mac[mac] = d
+        if _room(d.addrs, pkt.src):
+            d.addrs.add(pkt.src)
+            self.devices.setdefault(pkt.src, d)
+        if ":" in d.addr and "." in pkt.src:
+            d.addr = pkt.src   # show it under its IPv4 address
+        d.last_ts = pkt.ts
+        d.announcements += 1
         return d
 
-    def _find(self, src: str, m: dict) -> Device:
-        """The same device often announces from its IPv4 and IPv6 addresses; its A/AAAA records tie them together."""
-        d = self.devices.get(src)
-        if d is None:
-            d = next((self.devices[a] for a in m["addrs"] if a in self.devices), None)
-            if d is None and m["hostnames"]:
-                d = next((x for x in self.devices.values() if x.hostname in m["hostnames"]), None)
-            if d is not None:
-                self.devices[src] = d
-        if d is None:
-            # file it under its IPv4 address when it says what that is
-            v4 = sorted(a for a in m["addrs"] if "." in a)
-            d = self._device(v4[0] if v4 and ":" in src else src, m.get("ts", 0.0))
-            self.devices[src] = d
-        return d
+    def _searched(self, src: str, what: str) -> None:
+        c = self.searches.get(src)
+        if c is None:
+            if len(self.searches) >= MAX_DEVICES:
+                return
+            c = self.searches[src] = Counter()
+        if _room(c, what):
+            c[what] += 1
 
     def process(self, pkt) -> dict | None:
         """Update from one packet; returns what it said (for the narrator) or None if it wasn't discovery."""
         layer = pkt.layer("mdns")
         if layer is not None:
-            self.packets += 1
             m = interpret_mdns(layer.fields)
-            m["ts"] = pkt.ts
             if not m["response"]:
-                if m["asks"]:
-                    c = self.searches.setdefault(pkt.src, Counter())
-                    for s in m["asks"]:
-                        c[s] += 1
+                for s in m["asks"]:
+                    self._searched(pkt.src, s)
                 return dict(proto="mdns", m=m)
             if not (m["services"] or m["hostnames"]):
                 return dict(proto="mdns", m=m)
-            d = self._find(pkt.src, m)
-            d.last_ts = pkt.ts
-            d.announcements += 1
-            d.goodbyes += m["goodbye"]
+            d = self._device(pkt)
+            if d is None:
+                return dict(proto="mdns", m=m)
             for svc in m["services"]:
+                if not _room(d.services, svc):
+                    break
                 entry = d.services.setdefault(svc, dict(port=None, txt={}))
-                entry["txt"].update(m["txt"].get(svc, {}))
+                for k, v in m["txt"].get(svc, {}).items():
+                    if _room(entry["txt"], k):
+                        entry["txt"][k] = v
                 if svc in m["ports"]:
                     entry["port"] = m["ports"][svc]
             for inst in m["instances"].values():
-                if inst:
+                if inst and _room(d.names, inst):
                     d.names[inst] += 1
             if m["model"] and (not d.model or d.model_name == d.model):
                 d.model = m["model"]
             if m["hostnames"] and not d.hostname:
                 d.hostname = sorted(m["hostnames"])[0]
-            for a in m["addrs"] | {pkt.src}:
-                if a != d.addr:
-                    d.addrs.add(a)
-                self.devices.setdefault(a, d)
             return dict(proto="mdns", m=m, device=d)
         udp = pkt.layer("udp")
         if udp is not None and 1900 in (udp["sport"], udp["dport"]) and pkt.payload:
             s = parse_ssdp(pkt.payload)
             if s is None:
                 return None
-            self.packets += 1
             if s["kind"] == "search":
-                self.searches.setdefault(pkt.src, Counter())[s["target"] or "ssdp:all"] += 1
+                self._searched(pkt.src, s["target"] or "ssdp:all")
                 return dict(proto="ssdp", s=s)
-            d = self._device(pkt.src, pkt.ts)
-            d.announcements += 1
+            d = self._device(pkt)
+            if d is None:
+                return dict(proto="ssdp", s=s)
             d.server = d.server or s["server"]
-            if s["target"]:
+            if s["target"] and _room(d.upnp, s["target"]):
                 d.upnp.add(s["target"])
             return dict(proto="ssdp", s=s, device=d)
         return None
 
     def name_for(self, addr: str) -> str:
         d = self.devices.get(addr)
-        if d is None:
-            for dev in self.devices.values():
-                if addr in dev.addrs:
-                    d = dev
-                    break
         return d.title() if d is not None and (d.names or d.model or d.hostname) else ""
 
-    def unique(self) -> list[Device]:
-        return list({id(d): d for d in self.devices.values()}.values())
-
     def ranked(self) -> list[Device]:
-        return sorted(self.unique(), key=lambda d: (-len(d.services), -d.announcements))
+        unique = {id(d): d for d in (*self.by_mac.values(), *self.devices.values())}.values()
+        return sorted(unique, key=lambda d: (-len(d.services), -d.announcements))
 
 
 def explain_txt(txt: dict) -> list[tuple[str, str, str]]:

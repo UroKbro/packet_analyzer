@@ -10,6 +10,7 @@ from __future__ import annotations
 import struct
 
 from . import x509
+from .packet import printable
 
 CONTENT_TYPES = {20: "ChangeCipherSpec", 21: "Alert", 22: "Handshake", 23: "ApplicationData", 24: "Heartbeat"}
 HANDSHAKE_TYPES = {1: "ClientHello", 2: "ServerHello", 4: "NewSessionTicket", 8: "EncryptedExtensions",
@@ -106,12 +107,12 @@ def _parse_hello(body: bytes, client: bool, info: dict) -> None:
         ext = body[p + 4:p + 4 + elen]
         if etype == 0 and client and len(ext) >= 5:  # server_name
             name_len = struct.unpack_from("!H", ext, 3)[0]
-            info["sni"] = ext[5:5 + name_len].decode("ascii", "replace")
+            info["sni"] = printable(ext[5:5 + name_len].decode("ascii", "replace"))
         elif etype == 16 and len(ext) >= 3:  # ALPN
             alpn, q = [], 2
             while q < len(ext):
                 n = ext[q]
-                alpn.append(ext[q + 1:q + 1 + n].decode("ascii", "replace"))
+                alpn.append(printable(ext[q + 1:q + 1 + n].decode("ascii", "replace")))
                 q += 1 + n
             info["alpn"] = ",".join(alpn)
         elif etype == 43:  # supported_versions

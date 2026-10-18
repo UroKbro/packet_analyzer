@@ -11,7 +11,7 @@ import socket
 import struct
 
 from . import dns, http, tls
-from .packet import Layer, Packet
+from .packet import Layer, Packet, printable
 from .pcap import (LINKTYPE_ETHERNET, LINKTYPE_IPV4, LINKTYPE_IPV6, LINKTYPE_LINUX_SLL,
                    LINKTYPE_NULL, LINKTYPE_RAW)
 
@@ -496,7 +496,7 @@ def parse_dhcp(data: bytes) -> dict | None:
         if code == 53 and val:
             info["msg_type"] = DHCP_TYPES.get(val[0], str(val[0]))
         elif code == 12:
-            info["hostname"] = val.decode("ascii", "replace")
+            info["hostname"] = printable(val.decode("ascii", "replace"))
         elif code == 50 and ln == 4:
             info["requested_ip"] = ip4_str(val)
         i += 2 + ln

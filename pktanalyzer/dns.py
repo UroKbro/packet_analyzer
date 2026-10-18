@@ -4,6 +4,8 @@ from __future__ import annotations
 import socket
 import struct
 
+from .packet import printable
+
 TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 13: "HINFO", 15: "MX", 16: "TXT",
          28: "AAAA", 33: "SRV", 35: "NAPTR", 41: "OPT", 43: "DS", 46: "RRSIG", 47: "NSEC",
          48: "DNSKEY", 64: "SVCB", 65: "HTTPS", 99: "SPF", 255: "ANY", 257: "CAA"}
@@ -49,7 +51,7 @@ def read_name(data: bytes, off: int) -> tuple[str, int]:
             break
         if off + ln > len(data):
             raise DNSError("label runs past end of message")
-        labels.append(data[off:off + ln].decode("ascii", "backslashreplace"))
+        labels.append(printable(data[off:off + ln].decode("ascii", "backslashreplace")))
         off += ln
     return ".".join(labels) or ".", end_off if end_off is not None else off
 
@@ -69,7 +71,7 @@ def _rdata(data: bytes, off: int, rtype: int, rdlen: int):
         parts, i = [], 0
         while i < len(rd):
             n = rd[i]
-            parts.append(rd[i + 1:i + 1 + n].decode("utf-8", "replace"))
+            parts.append(printable(rd[i + 1:i + 1 + n].decode("utf-8", "replace")))
             i += 1 + n
         return " ".join(f'"{p}"' for p in parts)
     if rtype == 33:

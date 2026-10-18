@@ -10,7 +10,8 @@ from rich import box
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.panel import Panel
-from rich.table import Table
+from rich.markup import escape
+from rich.table import Table as RichTable
 from rich.text import Text
 from rich.tree import Tree
 
@@ -18,8 +19,9 @@ from . import timeline as TL
 from .analyzer import Analyzer, info
 from .anomalies import SEVERITY_ORDER, Alert
 from .flows import Flow
-from .packet import Packet
+from .packet import Packet, printable
 from .scoring import level_for
+from .story import human_bytes
 
 PROTO_STYLE = {
     "TCP": "cyan", "UDP": "dodger_blue1", "DNS": "magenta", "MDNS": "magenta", "HTTP": "green3",
@@ -50,18 +52,22 @@ LAYER_TITLES = {
 console = Console(highlight=False)
 
 
-def human_bytes(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
-
-
 def fmt_time(ts: float, t0: float | None, absolute: bool = False) -> str:
     if absolute or t0 is None:
         return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")
     return f"{ts - t0:.6f}"
+
+
+class Table(RichTable):
+    """A rich Table whose plain-string cells are shown literally.
+
+    rich parses ``[...]`` in string cells as markup, so a captured name like ``x[/y]`` would crash the
+    view (MarkupError) and ``/search?f[name]=1`` would silently lose ``[name]``. Cells here are
+    mostly names and headers off the wire, so strings become plain Text; pass a Text to style a cell.
+    """
+
+    def add_row(self, *renderables, **kwargs) -> None:
+        super().add_row(*(Text(r) if isinstance(r, str) else r for r in renderables), **kwargs)
 
 
 def _cell(text: str, width: int) -> str:
@@ -193,7 +199,7 @@ def layer_tree(pkt: Packet) -> Tree:
                     sn = node.add(Text(f"{sec} ({len(f[sec])})", style="grey62"))
                     for rr in f[sec]:
                         if sec == "questions":
-                            sn.add(f"{rr['name']}  {rr['type']}")
+                            sn.add(Text(f"{rr['name']}  {rr['type']}"))
                         else:
                             sn.add(Text.assemble(rr["name"], "  ", (rr["type"], "magenta"),
                                                  f"  ttl={rr['ttl']}  ", (str(rr["data"]), "bold")))
@@ -481,15 +487,16 @@ def hosts_table(hosts: list, limit: int | None = None, width: int | None = None)
 def host_panel(h, t0: float | None = None) -> Panel:
     """Everything known about one address."""
     t0 = t0 or h.first_ts
-    rows = Table.grid(padding=(0, 2))
+    rows = RichTable.grid(padding=(0, 2))  # values below use markup; anything from the wire goes through e()
     rows.add_column(style="grey62", no_wrap=True)
     rows.add_column(overflow="fold")
+    e = escape
 
     def row(label, value):
         if value:
             rows.add_row(label, value)
 
-    row("Names", ", ".join(f"{n} [grey50]({src})[/]" for n, src in list(h.names.items())[:6]))
+    row("Names", ", ".join(f"{e(n)} [grey50]({src})[/]" for n, src in list(h.names.items())[:6]))
     row("MAC", ", ".join(h.macs) + (" [grey50](router's MAC; host is off-link)[/]" if h.routed else ""))
     row("OS guess", h.os + (f" [grey50](TTL {h.syn['ttl']}, window {h.syn['window']}, "
                             f"options {h.syn['options'] or 'none'})[/]" if h.syn else ""))
@@ -508,11 +515,11 @@ def host_panel(h, t0: float | None = None) -> Panel:
     row("Uses", ", ".join(f"{k} ×{v}" for k, v in h.uses.most_common(10)))
     row("Peers", ", ".join(f"{p} [grey50]{human_bytes(b)}[/]" for p, b in h.peers.most_common(6)))
     if h.domains:
-        row("DNS lookups", "\n".join(f"{d}" + (f" ×{n}" if n > 1 else "") for d, n in h.domains.most_common(10))
+        row("DNS lookups", "\n".join(e(d) + (f" ×{n}" if n > 1 else "") for d, n in h.domains.most_common(10))
             + (f"\n[yellow3]{h.nxdomains} NXDOMAIN answer(s)[/]" if h.nxdomains else ""))
-    row("TLS SNI", ", ".join(h.sni))
-    row("HTTP hosts", ", ".join(h.http_hosts))
-    row("User-Agents", "\n".join(h.user_agents))
+    row("TLS SNI", e(", ".join(h.sni)))
+    row("HTTP hosts", e(", ".join(h.http_hosts)))
+    row("User-Agents", e("\n".join(h.user_agents)))
     if h.alerts_caused or h.alerts_targeted:
         row("Alerts", Text.assemble("caused ", _alert_text(h.alerts_caused) or Text("none", style="grey50"),
                                     "  targeted by ", _alert_text(h.alerts_targeted) or Text("none", style="grey50")))
@@ -520,7 +527,7 @@ def host_panel(h, t0: float | None = None) -> Panel:
     if h.max_risk:
         row("Riskiest flow", Text(f"{h.max_risk}/100", style=RISK_STYLE[level_for(h.max_risk)]))
     border = "red3" if h.alerts_caused["high"] else "dark_orange" if h.alerts_caused else "grey50"
-    title = f"[bold]{h.addr}[/]" + (f"  [grey62]{h.name}[/]" if h.name else "")
+    title = f"[bold]{h.addr}[/]" + (f"  [grey62]{e(h.name)}[/]" if h.name else "")
     return Panel(rows, title=title, title_align="left", border_style=border)
 
 def risk_table(flows: list[Flow], limit: int | None = None, show_all: bool = False) -> Table:
@@ -619,7 +626,7 @@ def handshake_panel(flow: Flow) -> Panel:
                 steps.append(f"{name} +{(hs[k] - t0) * 1000:.2f}ms")
             else:
                 steps.append(f"[red]{name} missing[/]")
-        t.add_row("Handshake", "  →  ".join(steps))
+        t.add_row("Handshake", Text.from_markup("  →  ".join(steps)))
     if flow.rtt is not None:
         hsd = flow.handshake
         t.add_row("RTT", f"{flow.rtt * 1000:.2f} ms  (server side {(hsd['synack'] - hsd['syn']) * 1000:.2f} ms, "
@@ -643,7 +650,8 @@ def stream_view(flow: Flow, max_bytes: int = 4000) -> Group:
         if ep is None or not ep.stream:
             continue
         data = bytes(ep.stream[:max_bytes])
-        text = data.decode("utf-8", "replace") if _printable(data) else _hex_preview(data)
+        text = printable(data.decode("utf-8", "replace").replace("\r\n", "\n"), keep="\n\t") if _printable(data) \
+            else _hex_preview(data)
         more = f"\n… {ep.stream_total - max_bytes} more bytes" if ep.stream_total > max_bytes else ""
         parts.append(Panel(Text(text + more, style=style), title=name, title_align="left", border_style=style))
     return Group(*parts) if parts else Group(Text("No reassembled payload in this flow.", style="grey50"))
@@ -1320,7 +1328,7 @@ def story_page(nar, ev, t0: float | None) -> Group:
             else:
                 t.add_row(item, discovery.search_meaning(item))
         parts.append(t)
-    dev = nar.an.discovery.devices.get(ev.src) if ev.kind == "announce" else None
+    dev = ev.data.get("device")
     if dev is not None:
         info = Table.grid(padding=(0, 2))
         info.add_column(style="grey62")
@@ -1339,8 +1347,8 @@ def story_page(nar, ev, t0: float | None) -> Group:
             t.add_column("What it means", overflow="fold", ratio=3, style="grey70")
             for k, v, m in discovery.explain_txt(entry["txt"]):
                 t.add_row(k, v, m)
-            title = f"{discovery.service_label(svc)} ({svc}" + (f", port {entry['port']}" if entry["port"] else "") \
-                + f") · it {discovery.service_meaning(svc)}"
+            title = Text(f"{discovery.service_label(svc)} ({svc}" + (f", port {entry['port']}" if entry["port"] else "")
+                         + f") · it {discovery.service_meaning(svc)}")
             parts.append(Panel(t if entry["txt"] else Text("no extra details", style="grey50"), title=title,
                                title_align="left", border_style="grey42"))
     return Group(*parts)

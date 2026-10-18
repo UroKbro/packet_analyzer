@@ -34,6 +34,9 @@ VOLUME_LABEL = {"web-tls": "encrypted web traffic (HTTPS)", "web-http": "unencry
 BACKGROUND_NOTE = ("Devices on a home or office network constantly announce what they are and look for each other "
                    "(mDNS/Bonjour, SSDP/UPnP, ARP). It is normal and usually not worth worrying about.")
 SAMPLE_PACKETS = 12
+MAX_EVENTS = 2000       # grouped lines kept; the least recently active one makes room for a new one
+MAX_ITEMS = 200         # names/ports/pages remembered per line
+MAX_SITES = 4096
 
 
 @dataclass
@@ -123,20 +126,19 @@ class Narrator:
 
     def __init__(self, an: Analyzer):
         self.an = an
-        self.events: dict[tuple, Event] = {}
+        self.events: dict[tuple, Event] = {}  # least recently active first
         self.volume: Counter = Counter()      # classify() -> bytes
         self.site: dict[str, str] = {}        # server address -> the name a client asked for (SNI / Host)
-        self.web_ports: set = set()           # (client, server, port) already told as a web visit
+        self.web_ports: dict = {}             # (client, server, port) already told as a web visit
         self._alerts_seen = 0
-        self.max_events = 2000
 
     # -- collecting ------------------------------------------------------------
-    def _event(self, key: tuple, kind: str, pkt, src: str = "", dst: str = "", flow=None) -> Event | None:
-        ev = self.events.get(key)
+    def _event(self, key: tuple, kind: str, pkt, src: str = "", dst: str = "", flow=None) -> Event:
+        ev = self.events.pop(key, None)  # re-inserted below, so the dict stays in least-recent-first order
         if ev is None:
-            if len(self.events) >= self.max_events:
-                return None
-            ev = self.events[key] = Event(key, kind, pkt.ts, pkt.ts, src=src, dst=dst)
+            self._make_room()
+            ev = Event(key, kind, pkt.ts, pkt.ts, src=src, dst=dst)
+        self.events[key] = ev
         ev.last_ts = pkt.ts
         if flow is not None:
             if flow.id in ev.flows:
@@ -146,6 +148,20 @@ class Narrator:
         if len(ev.packets) < SAMPLE_PACKETS:
             ev.packets.append(pkt.number)
         return ev
+
+    def _make_room(self) -> None:
+        """Forget the least recently active non-alert line when full, so a flood of junk (spoofed ARP,
+        random names) can push out old chatter but never stops new activity from being told."""
+        if len(self.events) < MAX_EVENTS:
+            return
+        oldest = next((k for k, e in self.events.items() if e.kind != "alert"), None)
+        del self.events[oldest if oldest is not None else next(iter(self.events))]
+
+    @staticmethod
+    def _remember(mapping: dict, key, value) -> None:
+        if key not in mapping and len(mapping) >= MAX_SITES:
+            del mapping[next(iter(mapping))]
+        mapping[key] = value
 
     def sync_alerts(self) -> None:
         alerts = self.an.alerts
@@ -157,7 +173,7 @@ class Narrator:
                                               data=dict(rule=a.rule, severity=a.severity, message=a.message))
             ev.count += 1
             ev.last_ts = max(ev.last_ts, a.ts)
-            if a.dst:
+            if a.dst and len(ev.items) < MAX_ITEMS:
                 ev.items[a.dst] = None
             if a.packet and len(ev.packets) < SAMPLE_PACKETS:
                 ev.packets.append(a.packet)
@@ -169,46 +185,46 @@ class Narrator:
         src, dst = pkt.src, pkt.dst
         if disc is not None:
             if "device" in disc:
-                addr = disc["device"].addr   # one line per device, whichever address it spoke from
-                ev = self._event(("announce", addr), "announce", pkt, addr)
+                dev = disc["device"]   # one line per device, whichever of its addresses it spoke from
+                ev = self._event(("announce", id(dev)), "announce", pkt)
+                ev.src, ev.data["device"] = dev.addr, dev
             else:
                 asks = disc["m"]["asks"] if disc["proto"] == "mdns" else ["ssdp:" + (disc["s"]["target"] or "ssdp:all")]
-                if not asks:
-                    return
-                ev = self._event(("search", src), "search", pkt, src)
-                for a in asks:
-                    if ev is not None:
+                if asks:
+                    ev = self._event(("search", src), "search", pkt, src)
+                    for a in asks[:MAX_ITEMS - len(ev.items)]:
                         ev.items[a] = None
             return
         d = pkt.layer("dns")
         if d is not None:
             if not d["response"] and d.get("qname"):
                 ev = self._event(("lookup", src), "lookup", pkt, src)
-                if ev is not None and len(ev.items) < 200:
+                if len(ev.items) < MAX_ITEMS:
                     ev.items[d["qname"].rstrip(".")] = None
             return
         tls = pkt.layer("tls")
         if tls is not None and tls.get("sni"):
-            self.site[dst] = tls["sni"]
+            self._remember(self.site, dst, tls["sni"])
             if pkt.layer("tcp") is not None:
-                self.web_ports.add((src, dst, pkt.layer("tcp")["dport"]))
+                self._remember(self.web_ports, (src, dst, pkt.layer("tcp")["dport"]), None)
             self._event(("web", src, tls["sni"]), "web", pkt, src, dst, flow)
             return
         h = pkt.layer("http")
         if h is not None and h.get("method"):
             host = h.get("host") or dst
-            self.site.setdefault(dst, host.split(":")[0])
+            if dst not in self.site:
+                self._remember(self.site, dst, host.split(":")[0])
             if pkt.layer("tcp") is not None:
-                self.web_ports.add((src, dst, pkt.layer("tcp")["dport"]))
+                self._remember(self.web_ports, (src, dst, pkt.layer("tcp")["dport"]), None)
             ev = self._event(("http", src, host), "http", pkt, src, dst)
-            if ev is not None and len(ev.items) < 50:
+            if len(ev.items) < MAX_ITEMS:
                 ev.items[h.get("uri", "/")] = None
             return
         tcp, udp = pkt.layer("tcp"), pkt.layer("udp")
         if tcp is not None:
             if tcp["flags.syn"] and not tcp["flags.ack"]:
                 ev = self._event(("connect", src, dst), "connect", pkt, src, dst, flow)
-                if ev is not None and len(ev.items) < 1000:
+                if len(ev.items) < MAX_ITEMS:
                     ev.items[tcp["dport"]] = None
             return
         if udp is not None:
@@ -219,9 +235,8 @@ class Narrator:
             dh = pkt.layer("dhcp")
             if dh is not None:
                 ev = self._event(("dhcp", dh["client_mac"], dh.get("msg_type", "?")), "dhcp", pkt, src, dst)
-                if ev is not None:
-                    ev.data.update(mac=dh["client_mac"], type=dh.get("msg_type", "?"), your_ip=dh.get("your_ip"),
-                                   hostname=dh.get("hostname") or ev.data.get("hostname"))
+                ev.data.update(mac=dh["client_mac"], type=dh.get("msg_type", "?"), your_ip=dh.get("your_ip"),
+                               hostname=dh.get("hostname") or ev.data.get("hostname"))
             return
         ic = pkt.layer("icmp") or pkt.layer("icmpv6")
         if ic is not None and ic.get("type") in (8, 128):
@@ -230,7 +245,7 @@ class Narrator:
         arp = pkt.layer("arp")
         if arp is not None and arp.get("op") == 1 and src != "?":
             ev = self._event(("arp", src), "arp", pkt, src)
-            if ev is not None and len(ev.items) < 200:
+            if len(ev.items) < MAX_ITEMS:
                 ev.items[arp["target_ip"]] = None
 
     # -- describing ------------------------------------------------------------
@@ -266,15 +281,21 @@ class Narrator:
     def describe(self, ev: Event, short: bool = False) -> str:
         """The event as a sentence; ``short`` drops the subject for lists under that device's name."""
         text = self._describe(ev)
-        who = self.who(ev.src)
+        who = self._subject(ev)
         if short and text.startswith(who + " "):
             text = text[len(who) + 1:]
             text = text[:1].upper() + text[1:]
         return text
 
+    def _subject(self, ev: Event) -> str:
+        dev = ev.data.get("device")
+        if dev is not None:  # the announcing device itself, even if another device has used its address
+            return f"{dev.name} ({dev.addr})" if dev.name else dev.addr
+        return self.who(ev.src)
+
     def _describe(self, ev: Event) -> str:
         k = ev.kind
-        who = self.who(ev.src)
+        who = self._subject(ev)
         if k == "alert":
             title = explain.explain(ev.data["rule"])[0]
             msg = ev.data["message"]
@@ -313,9 +334,7 @@ class Narrator:
             return (f"{who} asked who has {_list(ev.items, 2)} (ARP, finding devices by address)" if n <= 3 else
                     f"{who} checked which of {n} addresses are in use (ARP)")
         if k == "announce":
-            dev = self.an.discovery.devices.get(ev.src)
-            if dev is None:
-                return f"{who} is announcing itself"
+            dev = ev.data["device"]
             what = dev.kind
             labels = dev.labels
             article = "an" if what[:1] in "aeioAEIO" else "a"
@@ -338,9 +357,7 @@ class Narrator:
         if k == "alert":
             return explain.explain(ev.data["rule"])[1]
         if k == "announce":
-            dev = self.an.discovery.devices.get(ev.src)
-            bits = [f"It {discovery.service_meaning(s)}." for s in (dev.services if dev else {})
-                    if s not in ("_device-info",)]
+            bits = [f"It {discovery.service_meaning(s)}." for s in ev.data["device"].services if s != "_device-info"]
             return " ".join(bits[:6]) + " " + BACKGROUND_NOTE
         if k == "search":
             return ("Phones, computers and TV apps look for nearby screens, speakers and printers like this whenever "
@@ -387,7 +404,6 @@ def summarize(an: Analyzer) -> dict:
     from .hosts import profile
     an.finish()
     nar: Narrator = an.narrator
-    nar.sync_alerts()
     duration = (an.last_ts - an.first_ts) if an.count else 0.0
     hosts = profile(an) if an.count else []
     local = [h for h in hosts if h.local and h.addr not in ("0.0.0.0", "?") and (h.pkts_sent or h.pkts_recv)]
@@ -447,16 +463,15 @@ def summarize(an: Analyzer) -> dict:
                             weight=sum(1 for e in mine if e.category != "discovery")))
     devices.sort(key=lambda d: (-bool(d["rules"]), -d["weight"], -(d["sent"] + d["received"])))
     background = []
-    bg = Counter(e.kind for e in events if e.category == "discovery" or e.kind == "arp")
-    if bg:
-        n = sum(e.count for e in events if e.category == "discovery" or e.kind == "arp")
+    n = sum(e.count for e in events if e.category == "discovery" or e.kind == "arp")
+    if n:
         background.append(f"{n:,} packets were background chatter from devices finding each other "
                           "(announcements, searches and ARP), grouped into the lines above. " + BACKGROUND_NOTE)
     return dict(headline=headline, concerns=concerns, devices=devices, background=background, events=events,
                 nearby=nearby, volume=vol)
 
 
-def to_text(s: dict, nar: Narrator | None = None) -> str:
+def to_text(s: dict) -> str:
     """Plain text version of ``summarize`` for pipes, files and the report."""
     out = ["WHAT HAPPENED", ""] + [" ".join(s["headline"])] + [""]
     if s["concerns"]:
