@@ -22,6 +22,11 @@ PCAP_MAGIC_NS = 0xA1B23C4D
 PCAPNG_SHB = 0x0A0D0D0A
 PCAPNG_BOM = 0x1A2B3C4D
 
+# Largest record we will allocate. Real snaplens top out at 256 KiB; a 4 GiB
+# length field means the file is corrupt, not that we should try to read it.
+MAX_RECORD = 64 * 1024 * 1024
+MAX_TS = 253402300799.0  # 9999-12-31: past this datetime() refuses to format a corrupt timestamp
+
 
 @dataclass
 class Frame:
@@ -45,17 +50,22 @@ def open_capture(path: str) -> Iterator[Frame]:
             raise CaptureFormatError(f"{path}: file too short to be a capture")
         (magic_be,) = struct.unpack(">I", head)
         (magic_le,) = struct.unpack("<I", head)
-        if magic_be == PCAPNG_SHB:
-            yield from _read_pcapng(f)
-        elif {magic_be, magic_le} & {PCAP_MAGIC_US, PCAP_MAGIC_NS}:
-            yield from _read_pcap(f)
-        else:
-            raise CaptureFormatError(f"{path}: not a pcap or pcapng file (magic {head.hex()})")
+        try:
+            if magic_be == PCAPNG_SHB:
+                yield from _read_pcapng(f)
+            elif {magic_be, magic_le} & {PCAP_MAGIC_US, PCAP_MAGIC_NS}:
+                yield from _read_pcap(f)
+            else:
+                raise CaptureFormatError(f"{path}: not a pcap or pcapng file (magic {head.hex()})")
+        except (struct.error, IndexError) as e:
+            raise CaptureFormatError(f"{path}: corrupt capture file ({e})") from None
 
 
 def _read_pcap(f: BinaryIO) -> Iterator[Frame]:
     # Global header: magic, major, minor, thiszone, sigfigs, snaplen, network
     hdr = f.read(24)
+    if len(hdr) < 24:
+        raise CaptureFormatError("pcap global header is truncated")
     (magic,) = struct.unpack("<I", hdr[:4])
     if magic in (PCAP_MAGIC_US, PCAP_MAGIC_NS):
         endian = "<"
@@ -70,10 +80,12 @@ def _read_pcap(f: BinaryIO) -> Iterator[Frame]:
         if len(rh) < 16:
             return
         ts_sec, ts_frac, incl_len, orig_len = rec.unpack(rh)
+        if incl_len > MAX_RECORD:
+            raise CaptureFormatError(f"corrupt pcap record length {incl_len}")
         data = f.read(incl_len)
         if len(data) < incl_len:
             return  # truncated final record, as tcpdump does when killed mid-write
-        yield Frame(ts_sec + ts_frac / divisor, data, linktype, orig_len)
+        yield Frame(min(ts_sec + ts_frac / divisor, MAX_TS), data, linktype, orig_len)
 
 
 def _read_pcapng(f: BinaryIO) -> Iterator[Frame]:
@@ -87,15 +99,27 @@ def _read_pcapng(f: BinaryIO) -> Iterator[Frame]:
         if btype == PCAPNG_SHB:
             # Section header: the byte-order magic tells us the endianness of the section
             bom = f.read(4)
-            endian = "<" if struct.unpack("<I", bom)[0] == PCAPNG_BOM else ">"
+            if len(bom) < 4:
+                return
+            (bom_le,) = struct.unpack("<I", bom)
+            if bom_le == PCAPNG_BOM:
+                endian = "<"
+            elif struct.unpack(">I", bom)[0] == PCAPNG_BOM:
+                endian = ">"
+            else:
+                raise CaptureFormatError("corrupt pcapng section header (bad byte-order magic)")
             (blen,) = struct.unpack(endian + "I", bh[4:8])
+            if blen < 28 or blen > MAX_RECORD or blen % 4:
+                raise CaptureFormatError(f"corrupt pcapng section header length {blen}")
             f.read(blen - 12)
             interfaces = []
             continue
         (blen,) = struct.unpack(endian + "I", bh[4:8])
-        if blen < 12:
-            raise CaptureFormatError("corrupt pcapng block length")
+        if blen < 12 or blen > MAX_RECORD:
+            raise CaptureFormatError(f"corrupt pcapng block length {blen}")
         body = f.read(blen - 12)
+        if len(body) < blen - 12:
+            return  # truncated final block
         f.read(4)  # trailing copy of the block length
         if btype == 1:  # Interface Description Block
             linktype, _, _snaplen = struct.unpack_from(endian + "HHI", body, 0)
@@ -103,7 +127,7 @@ def _read_pcapng(f: BinaryIO) -> Iterator[Frame]:
         elif btype == 6:  # Enhanced Packet Block
             if_id, ts_hi, ts_lo, cap_len, orig_len = struct.unpack_from(endian + "IIIII", body, 0)
             linktype, unit = interfaces[if_id] if if_id < len(interfaces) else (LINKTYPE_ETHERNET, 1e-6)
-            ts = ((ts_hi << 32) | ts_lo) * unit
+            ts = min(((ts_hi << 32) | ts_lo) * unit, MAX_TS)
             yield Frame(ts, bytes(body[20:20 + cap_len]), linktype, orig_len)
         elif btype == 3:  # Simple Packet Block (no timestamp)
             (orig_len,) = struct.unpack_from(endian + "I", body, 0)
@@ -112,7 +136,7 @@ def _read_pcapng(f: BinaryIO) -> Iterator[Frame]:
         elif btype == 2:  # obsolete Packet Block
             if_id, _drops, ts_hi, ts_lo, cap_len, orig_len = struct.unpack_from(endian + "HHIIII", body, 0)
             linktype, unit = interfaces[if_id] if if_id < len(interfaces) else (LINKTYPE_ETHERNET, 1e-6)
-            yield Frame(((ts_hi << 32) | ts_lo) * unit, bytes(body[20:20 + cap_len]), linktype, orig_len)
+            yield Frame(min(((ts_hi << 32) | ts_lo) * unit, MAX_TS), bytes(body[20:20 + cap_len]), linktype, orig_len)
         # Every other block type (name resolution, stats, custom) is skipped.
 
 

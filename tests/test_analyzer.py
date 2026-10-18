@@ -67,8 +67,53 @@ class TestPcap(unittest.TestCase):
         self.assertEqual(frames[0].data, pkt)
         self.assertAlmostEqual(frames[0].ts, 1_700_000_000.123456789, places=5)
 
+    def test_corrupt_files_fail_cleanly(self):
+        """A damaged capture is reported as a format error, never a traceback or a giant allocation."""
+        from pktanalyzer.pcap import MAX_TS, CaptureFormatError
+        def block(btype, body, n=None):
+            n = n if n is not None else len(body) + 12
+            return struct.pack("<II", btype, n) + body + struct.pack("<I", n)
+        shb = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+        pcap_hdr = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+        cases = {
+            "short global header": pcap_hdr[:10],
+            "4 GiB record": pcap_hdr + struct.pack("<IIII", 0, 0, 0xFFFFFFF0, 60),
+            "tiny section header": struct.pack("<II", 0x0A0D0D0A, 4) + struct.pack("<I", 0x1A2B3C4D),
+            "bad byte-order magic": struct.pack("<II", 0x0A0D0D0A, 28) + b"\x00" * 20,
+            "short interface block": shb + block(1, b"\x01"),
+            "short packet block": shb + block(6, b"\x00" * 8),
+            "huge block": shb + struct.pack("<II", 6, 0xFFFFFFF0),
+        }
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "x")
+            for name, raw in cases.items():
+                with open(path, "wb") as f:
+                    f.write(raw)
+                with self.assertRaises(CaptureFormatError, msg=name):
+                    list(open_capture(path))
+            # a timestamp from the far future is clamped so views can still format it
+            with open(path, "wb") as f:
+                f.write(pcap_hdr + struct.pack("<IIII", 0xFFFFFFFF, 0, 4, 4) + b"abcd")
+            self.assertEqual(list(open_capture(path))[0].ts, min(0xFFFFFFFF, MAX_TS))
+
 
 class TestDecoder(unittest.TestCase):
+    def test_malformed_headers_are_not_tracked(self):
+        """A TCP header cut short, or ARP for other address types, must not crash flows, hosts or alerts."""
+        seg = craft.tcp(A, B, 1, 2, 0, 0, SYN)[:12]
+        short_tcp = craft.ethernet(MA, MB, 0x0800, craft.ipv4(A, B, 6, seg))
+        odd_arp = craft.ethernet(MA, "ff:ff:ff:ff:ff:ff", 0x0806,
+                                 struct.pack("!HHBBH", 6, 0x0800, 8, 4, 2) + bytes(28))
+        an = Analyzer()
+        for i, fr in enumerate((short_tcp, odd_arp)):
+            pkt = an.feed(Frame(1.0 + i, fr, LINKTYPE_ETHERNET, len(fr)))
+            info(pkt)
+        self.assertEqual(len(an.flows), 0)
+        self.assertTrue(an.packets[0].warnings)
+        self.assertIn("non-Ethernet", " ".join(an.packets[1].warnings))
+        report.build_report(an, "x")
+        story.summarize(an)
+
     def test_tcp_layers_and_checksums(self):
         p = decode(eth_tcp(A, B, 1234, 80, 100, 0, SYN, options=craft.tcp_mss_options(1460, 7)))
         self.assertEqual([l.name for l in p.layers], ["ethernet", "ipv4", "tcp"])
@@ -783,6 +828,29 @@ class TestStory(unittest.TestCase):
         self.assertIn("Evil[/x]\\x1b]0;pwned\\x07[bold]", out)
         self.assertIn("/a?f[name]=1", out)
         self.assertIn("\\x1b[31mred", out)
+
+    def test_report_escapes_wire_strings(self):
+        """Every name off the wire lands in the HTML report as text, never as markup."""
+        import time
+        x = "<img src=x onerror=alert(1)>"
+        now = time.time()
+        cert = craft.make_certificate({"CN": x}, {"CN": x}, now - 400 * 86400, now - 86400, [x])
+        frames = [eth_tcp(A, B, 5000, 80, 1, 0, PSH | ACK, f"GET /{x} HTTP/1.1\r\nHost: {x}\r\nUser-Agent: {x}\r\n\r\n".encode()),
+                  eth_tcp(A, B, 5001, 443, 1, 0, PSH | ACK, craft.tls_client_hello("a" + x)),
+                  eth_tcp(B, A, 443, 5001, 1, 0, PSH | ACK, craft.tls_record(22, craft.tls_server_hello(0x2F)
+                                                                           + craft.tls_certificate_msg([cert]))),
+                  craft.ethernet(MA, MB, 0x0800, craft.ipv4(A, B, 17, craft.udp(A, B, 5555, 53, craft.dns_query(1, x + ".com")))),
+                  self._mdns("02:00:00:00:00:66", "10.0.0.66", x, txt=(f"model={x}", f"{x}={x}")),
+                  craft.ethernet(MA, MB, 0x0800, craft.ipv4(A, "239.255.255.250", 17, craft.udp(
+                      A, "239.255.255.250", 1900, 1900, f"NOTIFY * HTTP/1.1\r\nNT: {x}\r\nSERVER: {x}\r\n\r\n".encode()))),
+                  craft.ethernet(MA, MB, 0x0800, craft.ipv4("0.0.0.0", "255.255.255.255", 17, craft.udp(
+                      "0.0.0.0", "255.255.255.255", 68, 67, craft.dhcp(1, 1, MA, hostname=x))))]
+        an = Analyzer()
+        for i, fr in enumerate(frames):
+            an.feed(Frame(1.0 + i, fr, LINKTYPE_ETHERNET, len(fr)))
+        html = report.build_report(an, x)
+        self.assertNotIn("<img", html)
+        self.assertGreater(html.count("&lt;img"), 5)
 
     def test_ssdp(self):
         s = discovery.parse_ssdp(b"M-SEARCH * HTTP/1.1\r\nST: roku:ecp\r\n\r\n")

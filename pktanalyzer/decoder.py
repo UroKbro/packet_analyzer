@@ -199,7 +199,9 @@ class Decoder:
             raise Truncated("ARP")
         htype, ptype, hlen, plen, op = struct.unpack_from("!HHBBH", buf, off)
         if hlen != 6 or plen != 4:
-            pkt.add(Layer("arp", off, end - off, op=op, sender_ip="?", target_ip="?"))
+            pkt.add(Layer("arp", off, end - off, op=op, op_name={1: "request", 2: "reply"}.get(op, str(op)),
+                          sender_ip="?", target_ip="?"))
+            pkt.warnings.append(f"ARP for non-Ethernet/IPv4 addresses (hlen {hlen}, plen {plen})")
             return
         p = off + 8
         smac, sip, tmac, tip = buf[p:p + 6], buf[p + 6:p + 10], buf[p + 10:p + 16], buf[p + 16:p + 20]

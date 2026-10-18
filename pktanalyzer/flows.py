@@ -184,6 +184,8 @@ class FlowTracker:
             proto, t = "udp", udp
         else:
             proto, t = ip["proto_name"].lower(), None
+            if proto in ("tcp", "udp"):
+                return None  # header too short to decode: nothing to track
         a = (ip["src"], t["sport"] if t else 0)
         b = (ip["dst"], t["dport"] if t else 0)
         key = (proto,) + (tuple(sorted((a, b))))

@@ -293,7 +293,7 @@ class AnomalyDetector:
             self._fire(pkt, "high", "injection", f"SQL injection / XSS pattern in URI: {h['uri'][:80]}")
 
     def _arp(self, pkt: Packet, a) -> None:
-        if a.get("op") != 2 and not a.get("gratuitous"):
+        if "sender_mac" not in a.fields or (a.get("op") != 2 and not a.get("gratuitous")):
             return
         ip, mac = a["sender_ip"], a["sender_mac"]
         old = self._arp_table.get(ip)

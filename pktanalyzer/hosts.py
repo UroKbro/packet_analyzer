@@ -146,7 +146,7 @@ class HostProfiler:
             if len(self.mac_ips[eth["src"]]) < LIST_CAP:
                 self.mac_ips[eth["src"]].add(src)
         if arp is not None:
-            if arp["op"] == 2 or arp.get("gratuitous"):
+            if "sender_mac" in arp.fields and (arp["op"] == 2 or arp.get("gratuitous")):
                 s.macs[arp["sender_mac"]] += 1
                 self.arp.setdefault(src, arp["sender_mac"])
             return

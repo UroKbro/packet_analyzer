@@ -136,7 +136,7 @@ def info(pkt: Packet) -> str:
         a = pkt.layers[-1]
         if a.get("op") == 1:
             parts.append(f"Who has {a['target_ip']}? Tell {a['sender_ip']}")
-        elif a.get("op") == 2:
+        elif a.get("op") == 2 and "sender_mac" in a.fields:
             parts.append(f"{a['sender_ip']} is at {a['sender_mac']}")
         if a.get("gratuitous"):
             parts.append("(gratuitous)")

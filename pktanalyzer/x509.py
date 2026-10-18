@@ -106,7 +106,8 @@ def parse_time(tag: int, raw: bytes) -> float:
         rest = s[4:]
     rest = rest.split(".")[0].ljust(10, "0")
     mon, day, hh, mm, ss = (int(rest[i:i + 2]) for i in range(0, 10, 2))
-    return float(calendar.timegm((year, mon, day, hh, mm, ss, 0, 0, 0)))
+    # Clamp to what datetime can format, so a forged year 0000 or 9999-13-99 can't crash a view
+    return min(max(float(calendar.timegm((year, mon, day, hh, mm, ss, 0, 0, 0))), 0.0), 253402300799.0)
 
 
 def _fp(data: bytes, algo: str) -> str:
