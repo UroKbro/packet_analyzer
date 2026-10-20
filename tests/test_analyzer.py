@@ -1,9 +1,12 @@
 """Unit tests. Run with:  python -m unittest discover -s tests -v"""
 import base64
 import io
+import ipaddress
+import threading
 import json
 import os
 import re
+import socket
 import struct
 import sys
 import tempfile
@@ -1059,6 +1062,95 @@ class TestCLI(unittest.TestCase):
             self.assertIn("Living Room (10.0.0.30) announced itself", out)
             with open(os.path.join(d, "s.txt")) as fh:
                 self.assertIn("WHAT HAPPENED", fh.read())
+
+
+class TestNetscan(unittest.TestCase):
+    """The active-diagnostics helpers. Network I/O is tested only against loopback."""
+
+    def test_port_service_and_risk(self):
+        from pktanalyzer import netscan as n
+        self.assertEqual(n.port_service(22, "SSH-2.0-OpenSSH_9.6"), "SSH")
+        self.assertEqual(n.port_service(80, ""), "HTTP")
+        self.assertEqual(n.port_service(3306, ""), "MySQL")
+        self.assertEqual(n.port_service(55555, ""), "port 55555")
+        self.assertEqual(n.port_risk(23)[0], "high")
+        self.assertEqual(n.port_risk(443), ("", ""))  # HTTPS is not flagged
+
+    def test_wifi_parsers(self):
+        from pktanalyzer import netscan as n
+        self.assertEqual(n.classify_wifi_security("WPA2 WPA3 SAE"), "WPA3")
+        self.assertEqual(n.classify_wifi_security("WEP"), "WEP (weak)")
+        self.assertTrue(n.classify_wifi_security("").startswith("Open"))
+        self.assertEqual(n.channel_from_freq(2437), 6)
+        self.assertEqual(n.channel_from_freq(5180), 36)
+        nm = n.parse_nmcli_wifi(r"Home\:Net:AA\:BB\:CC\:11\:22\:33:80:6:WPA2")[0]
+        self.assertEqual((nm.ssid, nm.bssid, nm.channel, nm.security), ("Home:Net", "AA:BB:CC:11:22:33", 6, "WPA2"))
+        self.assertEqual(nm.signal_dbm, -60)
+        iw = n.parse_iw_scan("BSS aa:bb:cc:dd:ee:ff(on wlan0)\n\tfreq: 2412\n\tsignal: -40.00 dBm\n"
+                             "\tSSID: MyHome\n\tRSN:\t * Version: 1\n")[0]
+        self.assertEqual((iw.ssid, iw.channel, iw.security), ("MyHome", 1, "WPA2"))
+        self.assertEqual(iw.signal_dbm, -40)
+        air = n.parse_airport_scan("    SSID BSSID RSSI CHANNEL HT CC SECURITY\n"
+                                   "  MyHome aa:bb:cc:dd:ee:ff -42 6 Y US WPA2(PSK/AES/AES)\n"
+                                   "   Guest 11:22:33:44:55:66 -70 36 Y US NONE")
+        self.assertEqual((air[0].ssid, air[0].security), ("MyHome", "WPA2"))
+        self.assertTrue(air[1].security.startswith("Open"))
+
+    def test_arp_and_whois_parsers(self):
+        from pktanalyzer import netscan as n
+        table = n.parse_arp_table("? (10.0.0.1) at aa:bb:cc:0:1:2 on en0 ifscope [ethernet]\n"
+                                  "10.0.0.2 0x1 0x2 de:ad:be:ef:00:01 * eth0\n"
+                                  "10.0.0.3 (incomplete) 00:00:00:00:00:00\n")
+        self.assertEqual(table, {"10.0.0.1": "aa:bb:cc:00:01:02", "10.0.0.2": "de:ad:be:ef:00:01"})
+        who = n.parse_whois("% comment\nOrgName:        Google LLC\nNetName: GOOGLE\nCountry: US\nrefer: whois.arin.net")
+        self.assertEqual((who["owner"], who["netname"], who["country"], who["refer"]),
+                         ("Google LLC", "GOOGLE", "US", "whois.arin.net"))
+
+    def test_audit_ranks_findings(self):
+        from pktanalyzer import netscan as n
+        scans = [n.ScanResult("10.0.0.5", "10.0.0.5", [(23, "TELNET", ""), (22, "SSH", ""), (80, "HTTP", "")]),
+                 n.ScanResult("10.0.0.6", "10.0.0.6", []),
+                 n.ScanResult("bad", "", error="could not resolve 'bad'")]
+        findings = n.audit_hosts(scans)
+        self.assertEqual(findings[0].severity, "high")  # Telnet sorts to the top
+        self.assertIn("Telnet", findings[0].message)
+        self.assertTrue(any(f.host.startswith("10.0.0.6") and "No open ports" in f.message for f in findings))
+
+    def test_scan_and_discover_loopback(self):
+        from pktanalyzer import netscan as n
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(16)
+        stop = threading.Event()
+
+        def accept():
+            srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    c, _ = srv.accept()
+                    c.close()
+                except OSError:
+                    pass
+        th = threading.Thread(target=accept, daemon=True)
+        th.start()
+        try:
+            res = n.scan_ports("127.0.0.1", ports=(port, port + 1), timeout=0.3, banners=False)
+            self.assertEqual([p for p, _, _ in res.open_ports], [port])
+            hosts = n.discover(ipaddress.ip_network("127.0.0.1/32"), timeout=0.3, probe_ports=(port,))
+            self.assertEqual([h.ip for h in hosts], ["127.0.0.1"])
+            self.assertEqual(hosts[0].responded_on, port)
+        finally:
+            stop.set()
+            srv.close()
+            th.join(timeout=1)
+
+    def test_scan_rejects_oversized(self):
+        from pktanalyzer import netscan as n
+        with self.assertRaises(ValueError):
+            n.scan_ports("127.0.0.1", ports=tuple(range(n.MAX_SCAN_PORTS + 2)))
+        with self.assertRaises(ValueError):
+            n.discover(ipaddress.ip_network("10.0.0.0/8"))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from . import __version__, diff, explain, hosts, report, scoring, timeline, ui
+from . import __version__, diff, explain, hosts, netscan, report, scoring, timeline, ui
 from .analyzer import Analyzer
 from .capture import CaptureError, default_interface, list_interfaces, live_frames
 from .craft import write_sample
@@ -227,6 +227,223 @@ def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
+# ---------------------------------------------------------------------------
+# active network diagnostics (netscan): look up, discover, scan, Wi-Fi, audit
+# ---------------------------------------------------------------------------
+SEV_COLOUR = {"high": "bold red", "medium": "yellow", "low": "cyan", "info": "grey62"}
+
+
+def _authorized() -> None:
+    con.print("[grey50]These commands reach out onto the network. Use them only on networks you "
+              "own or are authorised to test.[/]")
+
+
+def _progress(label: str):
+    return con.status(f"[cyan]{label}", spinner="dots")
+
+
+def cmd_trace(args) -> None:
+    from rich.table import Table
+    _authorized()
+    with _progress(f"Looking up {args.target}…"):
+        lk = netscan.lookup(args.target, do_whois=not args.no_whois)
+    if lk.error:
+        con.print(f"[bold red]{lk.error}")
+        raise SystemExit(1)
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="grey62", no_wrap=True)
+    grid.add_column()
+    grid.add_row("Address", f"[bold]{lk.ip}[/]" + ("  [grey50](private / local)[/]" if lk.is_private else ""))
+    if lk.addresses and lk.addresses != [lk.ip]:
+        grid.add_row("All addresses", ", ".join(lk.addresses))
+    if lk.names:
+        grid.add_row("Reverse DNS", "\n".join(lk.names))
+    if lk.owner:
+        grid.add_row("Owner", lk.owner)
+    if lk.netname:
+        grid.add_row("Network", lk.netname)
+    if lk.country:
+        grid.add_row("Country", lk.country)
+    con.print(Panel(grid, title=f"[bold]{lk.query}[/]", border_style="cyan", title_align="left", padding=(1, 2)))
+    if args.no_path:
+        return
+    try:
+        with _progress(f"Tracing the path to {lk.ip}…"):
+            hops = netscan.traceroute(args.target, max_hops=args.max_hops)
+    except PermissionError:
+        con.print("[grey62]Path tracing needs raw-socket access — run with sudo to see the route.[/]")
+        return
+    except OSError as e:
+        con.print(f"[grey62]Could not trace the path: {e}[/]")
+        return
+    t = ui.Table(title="Path", title_style="bold", border_style="grey35", header_style="bold grey70")
+    t.add_column("#", justify="right", style="grey62")
+    t.add_column("Router")
+    t.add_column("Name", style="grey62")
+    t.add_column("RTT", justify="right")
+    for hop in hops:
+        rtt = f"{hop.rtt_ms:.0f} ms" if hop.rtt_ms is not None else ""
+        router = Text(hop.ip) if hop.ip else Text("* no reply", style="grey50")
+        t.add_row(str(hop.ttl), router, hop.name, rtt)
+    con.print(t)
+
+
+def cmd_discover(args) -> None:
+    import ipaddress
+    _authorized()
+    try:
+        network = ipaddress.ip_network(args.network, strict=False) if args.network else netscan.local_network()
+    except ValueError as e:
+        con.print(f"[bold red]{e}")
+        raise SystemExit(2)
+    con.print(f"[grey62]Scanning [bold]{network}[/] for live devices…[/]")
+    try:
+        with _progress(f"Checking {network.num_addresses} addresses…") as status:
+            hosts_found = netscan.discover(
+                network, timeout=args.timeout,
+                progress=lambda d, t: status.update(f"[cyan]Checking addresses… {d}/{t}"))
+    except ValueError as e:
+        con.print(f"[bold red]{e}")
+        raise SystemExit(2)
+    if not hosts_found:
+        con.print("[grey62]No devices answered. They may be quiet, or a firewall is dropping probes.[/]")
+        return
+    t = ui.Table(border_style="grey35", header_style="bold grey70")
+    t.add_column("Address", style="bold")
+    t.add_column("MAC", style="grey62")
+    t.add_column("Name")
+    t.add_column("Seen via", style="grey62")
+    me = netscan.local_ipv4()
+    for h in hosts_found:
+        via = netscan.port_service(h.responded_on) if h.responded_on else "ARP cache"
+        name = Text(h.name)
+        if h.ip == me:
+            name.append("  (this computer)", style="cyan")
+        t.add_row(h.ip, h.mac, name, via)
+    con.print(t)
+    con.print(f"[grey50]{len(hosts_found)} device(s) up. Scan one with [bold]pktanalyzer portscan ADDRESS[/].[/]")
+
+
+def _port_ports(args) -> tuple:
+    if not args.ports:
+        return netscan.COMMON_PORTS
+    out = []
+    for part in args.ports.split(","):
+        part = part.strip()
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        elif part:
+            out.append(int(part))
+    return tuple(out)
+
+
+def cmd_portscan(args) -> None:
+    _authorized()
+    try:
+        ports = _port_ports(args)
+    except ValueError:
+        con.print("[bold red]--ports must be numbers and ranges, e.g. 1-1024,3389,8080")
+        raise SystemExit(2)
+    con.print(f"[grey62]Scanning [bold]{args.host}[/] ({len(ports)} ports)…[/]")
+    try:
+        with _progress("Scanning ports…") as status:
+            res = netscan.scan_ports(args.host, ports, timeout=args.timeout, banners=not args.no_banners,
+                                     progress=lambda d, t: status.update(f"[cyan]Scanning ports… {d}/{t}"))
+    except ValueError as e:
+        con.print(f"[bold red]{e}")
+        raise SystemExit(2)
+    if res.error:
+        con.print(f"[bold red]{res.error}")
+        raise SystemExit(1)
+    if not res.open_ports:
+        con.print(f"[green3]No open ports on {res.host} ({res.ip}) among the {len(ports)} checked.[/]")
+        return
+    t = ui.Table(title=f"Open ports on {res.host} ({res.ip})", title_style="bold",
+                 border_style="grey35", header_style="bold grey70")
+    t.add_column("Port", justify="right", style="bold")
+    t.add_column("Service")
+    t.add_column("Risk")
+    t.add_column("Banner", style="grey62")
+    for port, service, banner in res.open_ports:
+        sev, _ = netscan.port_risk(port)
+        risk = Text(sev, style=SEV_COLOUR[sev]) if sev else Text("")
+        t.add_row(str(port), service, risk, (banner[:60] + "…") if len(banner) > 60 else banner)
+    con.print(t)
+    risky = [(p, netscan.port_risk(p)) for p, _, _ in res.open_ports if netscan.port_risk(p)[1]]
+    for port, (sev, note) in risky:
+        con.print(f"  [{SEV_COLOUR[sev]}]●[/] {note}")
+
+
+def cmd_wifi(args) -> None:
+    _authorized()
+    with _progress("Scanning for nearby Wi-Fi…"):
+        nets, note = netscan.wifi_scan()
+    if not nets:
+        con.print(f"[yellow]{note or 'No Wi-Fi networks found.'}[/]")
+        return
+    nets.sort(key=lambda w: (w.signal_dbm is None, -(w.signal_dbm or -999)))
+    t = ui.Table(title="Nearby Wi-Fi networks", title_style="bold", border_style="grey35",
+                 header_style="bold grey70")
+    t.add_column("Network", style="bold")
+    t.add_column("Signal")
+    t.add_column("Ch", justify="right", style="grey62")
+    t.add_column("Security")
+    for w in nets:
+        dbm = f"{netscan.signal_bars(w.signal_dbm)} {w.signal_dbm} dBm" if w.signal_dbm is not None else ""
+        sec_style = "red" if w.security.startswith(("Open", "WEP")) else "green3" if "WPA3" in w.security else ""
+        t.add_row(w.ssid, dbm, str(w.channel or ""), Text(w.security, style=sec_style))
+    con.print(t)
+    weak = [w for w in nets if w.security.startswith(("Open", "WEP"))]
+    if weak:
+        con.print(f"[grey50]{len(weak)} network(s) use no or weak encryption (shown in red).[/]")
+
+
+def cmd_audit(args) -> None:
+    import ipaddress
+    _authorized()
+    if args.host:
+        targets = [args.host]
+    else:
+        try:
+            network = ipaddress.ip_network(args.network, strict=False) if args.network else netscan.local_network()
+        except ValueError as e:
+            con.print(f"[bold red]{e}")
+            raise SystemExit(2)
+        con.print(f"[grey62]Finding devices on [bold]{network}[/]…[/]")
+        with _progress("Finding devices…") as status:
+            found = netscan.discover(network, timeout=args.timeout,
+                                     progress=lambda d, t: status.update(f"[cyan]Finding devices… {d}/{t}"))
+        if not found:
+            con.print("[grey62]No devices answered, so there is nothing to check.[/]")
+            return
+        targets = [h.ip for h in found]
+        con.print(f"[grey62]Checking {len(targets)} device(s) for risky open services…[/]")
+    scans = []
+    with _progress("Checking devices…") as status:
+        for i, host in enumerate(targets, 1):
+            status.update(f"[cyan]Checking {host}… ({i}/{len(targets)})")
+            scans.append(netscan.scan_ports(host, timeout=args.timeout, banners=False))
+    findings = netscan.audit_hosts(scans)
+    highs = sum(1 for f in findings if f.severity == "high")
+    meds = sum(1 for f in findings if f.severity == "medium")
+    if highs:
+        head, style = f"{highs} serious and {meds} other issue(s) found.", "bold red"
+    elif meds:
+        head, style = f"{meds} issue(s) worth a look, nothing serious.", "yellow"
+    else:
+        head, style = "Nothing risky found. Your network looks tidy.", "green3"
+    con.print(Panel(Text(head, style=style), title="[bold]Security check[/]", border_style=style.split()[-1],
+                    title_align="left"))
+    for f in findings:
+        if f.severity == "info" and not args.all:
+            continue
+        badge = Text(f" {f.severity.upper()} ", style="reverse " + SEV_COLOUR[f.severity])
+        con.print(badge, Text(f.host, style="bold"), Text(f.message))
+    if any(f.severity == "info" for f in findings) and not args.all:
+        con.print("[grey50]Clean hosts hidden; pass --all to list everything.[/]")
+
+
 def cmd_explore(args) -> None:
     an = _analyze(args.file)
     if not _interactive():
@@ -257,6 +474,11 @@ WELCOME = [
     ("Open a capture file", "pktanalyzer capture.pcap", "browse it with the keyboard (? shows the keys)"),
     ("Explain a capture simply", "pktanalyzer summary capture.pcap", "what happened, in plain English"),
     ("Watch your network live", "sudo pktanalyzer live", "full-screen dashboard"),
+    ("Find devices on your network", "pktanalyzer discover", "every device that is online right now"),
+    ("Check what's exposed", "pktanalyzer audit", "flags risky open services in plain English"),
+    ("Scan one host's ports", "pktanalyzer portscan 192.168.1.1", "which ports are open and what runs there"),
+    ("Look up an address", "pktanalyzer trace github.com", "owner, reverse DNS and the route"),
+    ("List nearby Wi-Fi", "pktanalyzer wifi", "signal, channel and security of each network"),
     ("Record traffic to a file", "sudo pktanalyzer capture -w out.pcap", "Ctrl-C to stop"),
     ("Narrate live traffic", "sudo pktanalyzer capture --plain", "one readable line per new activity"),
     ("Make a shareable report", "pktanalyzer report capture.pcap", "one HTML file"),
@@ -453,6 +675,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  pktanalyzer capture.pcap            explore a capture (same as: explore capture.pcap)\n"
                "  pktanalyzer summary capture.pcap    what happened, in plain English\n"
                "  sudo pktanalyzer live               live dashboard\n"
+               "  pktanalyzer discover                live devices on your network\n"
+               "  pktanalyzer audit                   security check of your network\n"
+               "  pktanalyzer portscan 192.168.1.1    open ports on one host\n"
+               "  pktanalyzer trace github.com        look up an address and its route\n"
+               "  pktanalyzer wifi                    nearby Wi-Fi networks\n"
                "  pktanalyzer report capture.pcap     HTML incident report\n"
                "  pktanalyzer COMMAND -h              help for one command")
     p.add_argument("--version", action="version", version=f"pktanalyzer {__version__}")
@@ -592,6 +819,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     i = sub.add_parser("interfaces", help="list network interfaces")
     i.set_defaults(func=cmd_interfaces)
+
+    # -- active network diagnostics (reach out onto the network; own networks only) --
+    tr = sub.add_parser("trace", help="look up an address: reverse DNS, who owns it, and the path to it")
+    tr.add_argument("target", help="a hostname or IP address")
+    tr.add_argument("--no-whois", action="store_true", help="skip the ownership (whois) lookup")
+    tr.add_argument("--no-path", action="store_true", help="skip tracing the route")
+    tr.add_argument("--max-hops", type=int, default=30)
+    tr.set_defaults(func=cmd_trace)
+
+    dc = sub.add_parser("discover", help="list the live devices on your own network")
+    dc.add_argument("network", nargs="?", help="range to scan, e.g. 192.168.1.0/24 (default: your own subnet)")
+    dc.add_argument("--timeout", type=float, default=0.4, help="per-probe timeout in seconds")
+    dc.set_defaults(func=cmd_discover)
+
+    ps = sub.add_parser("portscan", help="see which ports are open on a host you own, and what runs there")
+    ps.add_argument("host", help="a hostname or IP address on a network you control")
+    ps.add_argument("--ports", help="ports to check, e.g. 1-1024,3389,8080 (default: common ports)")
+    ps.add_argument("--timeout", type=float, default=0.6, help="per-port timeout in seconds")
+    ps.add_argument("--no-banners", action="store_true", help="don't read service banners")
+    ps.set_defaults(func=cmd_portscan)
+
+    wf = sub.add_parser("wifi", help="list nearby Wi-Fi networks with signal, channel and security (read-only)")
+    wf.set_defaults(func=cmd_wifi)
+
+    au = sub.add_parser("audit", help="security check: find your devices and flag risky open services")
+    au.add_argument("host", nargs="?", help="check one host instead of your whole network")
+    au.add_argument("--network", help="range to check, e.g. 192.168.1.0/24 (default: your own subnet)")
+    au.add_argument("--timeout", type=float, default=0.5)
+    au.add_argument("--all", action="store_true", help="also list devices with nothing wrong")
+    au.set_defaults(func=cmd_audit)
     return p
 
 

@@ -84,6 +84,7 @@ Warning   Port scan from 10.0.0.66: 15 ports probed on 10.0.0.23 in 10s
 | **Capture diff** | `diff before.pcap after.pcap` compares two captures by stable keys (client → server:port, DNS name + type, TLS SNI): new and missing conversations (a scan collapses to one line), conversations whose bytes, retransmissions, RTT or risk changed, changed DNS answers and new names, new, increased and resolved alerts, changed TLS servers and certificates, new hosts and newly open ports, protocol mix and per-host bandwidth. `--json` saves the result. |
 | **Incident report** | `report` writes one self-contained HTML file (no scripts, no external assets, light and dark themes) with an executive summary, a timeline chart, every alert explained in plain language with a recommended action, suspicious hosts, top talkers, risk-ranked conversations, DNS, HTTP and TLS activity, and the JSON exports embedded as downloads. `alerts --explain` gives the same explanations in the terminal. |
 | **Export** | `flows.json/csv`, `packets.jsonl`, `alerts.json`, `hosts.json`, `dns.json`, `http.json`, a filtered `packets.pcap`, and the reassembled TCP streams with extracted HTTP bodies |
+| **Network diagnostics** | Active tools for your own network (read-only, no attacks): `discover` lists the devices that are online, `portscan HOST` shows which ports are open and what runs there, `trace ADDR` gives reverse DNS, who owns an address (whois) and the route to it, `wifi` lists nearby Wi-Fi networks with signal, channel and security, and `audit` ties them together into a plain-English security check that flags risky open services (Telnet, exposed databases, RDP/VNC, ...) |
 
 ## Install
 
@@ -132,6 +133,20 @@ sudo python3 -m pktanalyzer capture -i en0 -c 50 -v       # first 50 packets, fu
 
 On macOS the interface is usually `en0` (Wi-Fi). On Linux it's usually `eth0` or `wlan0`. Checksum validation is off by default for live capture, because the network card fills in checksums for outgoing packets after the kernel hands them to us, so they would all look wrong. Pass `--checksums` to turn it on.
 
+## Scan your own network
+
+These reach out onto the network, so use them only on networks you own or are authorised to test. Most need no root; only tracing a route does.
+
+```bash
+python3 -m pktanalyzer discover                 # live devices on your own subnet (IP, MAC, name)
+python3 -m pktanalyzer discover 192.168.1.0/24  # a specific range
+python3 -m pktanalyzer portscan 192.168.1.1     # open ports and services on one host you own
+python3 -m pktanalyzer audit                    # security check: risky open services, in plain English
+python3 -m pktanalyzer trace github.com         # reverse DNS, owner (whois) and the route (sudo for the route)
+python3 -m pktanalyzer wifi                      # nearby Wi-Fi: signal, channel, security
+```
+
+
 ## Display filters
 
 ```text
@@ -172,6 +187,7 @@ pktanalyzer/
 ├── timeline.py   time-ordered event view (handshakes, DNS, HTTP, TLS, resets, alerts)
 ├── hosts.py      per-host profiles: names, MAC, OS guess, roles, services, lookups, alerts
 ├── discovery.py  mDNS/Bonjour and SSDP/UPnP: devices, models, services and TXT keys in plain words
+├── netscan.py    active own-network tools: address lookup/whois/traceroute, LAN discovery, port scan, Wi-Fi, audit
 ├── story.py      groups packets into plain-English events and writes the capture's summary
 ├── hunt.py       beaconing and exfiltration detection across the whole capture
 ├── explorer.py   interactive keyboard-driven explorer (state machine + terminal key reader)
